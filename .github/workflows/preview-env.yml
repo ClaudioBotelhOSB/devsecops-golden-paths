@@ -1,0 +1,346 @@
+# ==============================================================================
+# .github/workflows/preview-env.yml
+# Zero-Trust Delivery Platform - Preview Environments
+# Owner: platform engineering
+#
+# Lifecycle:
+#   * provision fires on workflow_run(Backend CI (Go)).conclusion == success
+#     for a pull_request event, so the signed digest from build-sign already
+#     exists in GHCR before we try to deploy it.
+#   * teardown fires on pull_request.closed (merged or abandoned).
+#
+# The provision job does NOT deploy by tag. It downloads the `digest-*`
+# artifact produced by the PR build, extracts the signed digest, and passes
+# `image.digest=sha256:...` to Helm. That means Kyverno's require-signed-images
+# policy gate validates the exact image the PR built. No Phase C bypass.
+# ==============================================================================
+
+name: Preview environment
+
+on:
+  workflow_run:
+    workflows: ["Backend CI (Go)"]
+    types: [completed]
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to (re)provision"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-env-pr-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  # ---- Central platform context ----
+  PLATFORM_OWNER:        ${{ vars.PLATFORM_OWNER        || github.repository_owner }}
+  PLATFORM_EMAIL_DOMAIN: ${{ vars.PLATFORM_EMAIL_DOMAIN || 'example.internal' }}
+  PLATFORM_COST_CENTER:  ${{ vars.PLATFORM_COST_CENTER  || 'platform' }}
+  DEFAULT_REGION:        ${{ vars.DEFAULT_REGION        || 'us-east-1' }}
+  PREVIEW_CLUSTER_NAME:  ${{ vars.PREVIEW_CLUSTER_NAME  || 'preview-cluster' }}
+  PREVIEW_BASE_DOMAIN:   ${{ vars.PREVIEW_BASE_DOMAIN   || 'preview.example.internal' }}
+  # ---- Workflow-specific ----
+  TTL:             "72h"
+  HELM_VERSION:    v3.16.3
+  KUBECTL_VERSION: v1.31.3
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Gate: only provision if the upstream build succeeded AND it was a PR event.
+  # ----------------------------------------------------------------------------
+  should-provision:
+    name: Gate preview provision
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'pull_request'
+      )
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      pr: ${{ steps.set.outputs.pr }}
+      head_sha: ${{ steps.set.outputs.head_sha }}
+      run_id: ${{ steps.set.outputs.run_id }}
+    steps:
+      - id: set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR="${{ inputs.pr_number }}"
+            HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR}" --jq '.head.sha')
+            RUN_ID=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --workflow "Backend CI (Go)" \
+              --limit 50 \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha==\"${HEAD_SHA}\") | .databaseId" | head -1)
+          else
+            PR="${{ github.event.workflow_run.pull_requests[0].number }}"
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          fi
+          if [ -z "${PR}" ] || [ -z "${HEAD_SHA}" ] || [ -z "${RUN_ID}" ]; then
+            echo "::error::Could not resolve PR/run correlation"
+            exit 1
+          fi
+          echo "pr=${PR}"           >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "run_id=${RUN_ID}"   >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------------------
+  # PROVISION
+  # ----------------------------------------------------------------------------
+  provision:
+    name: Provision preview env
+    needs: should-provision
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      actions: read         # download artifact from upstream run
+      pull-requests: write  # comment preview URL back on PR
+    outputs:
+      namespace: ${{ steps.ns.outputs.name }}
+      host:      ${{ steps.ns.outputs.host }}
+      digest:    ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install kubectl + helm (pinned)
+        run: |
+          set -euo pipefail
+          curl -sSL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          curl -sSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz -C /tmp linux-amd64/helm
+          install /tmp/linux-amd64/helm /usr/local/bin/helm
+
+      - name: Install Cosign (pinned)
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da
+        with:
+          cosign-release: v2.4.1
+
+      - name: Download primary digest pointer from upstream build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The primary image is always `api` - see build-sign matrix in
+          # backend-ci.yml. Rename there if you run multi-service builds.
+          mkdir -p upstream
+          gh run download "${{ needs.should-provision.outputs.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --name "digest-api-${{ needs.should-provision.outputs.head_sha }}" \
+            --dir upstream
+          ls -la upstream/
+
+      - name: Extract signed digest
+        id: digest
+        run: |
+          set -euo pipefail
+          DIGEST=$(jq -r '.digest' upstream/digest-api.json)
+          IMAGE=$(jq -r '.image'   upstream/digest-api.json)
+          REF="${IMAGE}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}"   >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}"       >> "$GITHUB_OUTPUT"
+
+      # Before we even deploy, verify the digest signature client-side.
+      # If this fails, preview never boots for this PR.
+      - name: Cosign verify (signature + SPDX + SLSA)
+        run: |
+          set -euo pipefail
+          REF="${{ steps.digest.outputs.ref }}"
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/backend-ci\\.yml@.*$" \
+            --certificate-oidc-issuer    "https://token.actions.githubusercontent.com" \
+            "${REF}"
+          cosign verify-attestation --type spdxjson \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/backend-ci\\.yml@.*$" \
+            --certificate-oidc-issuer    "https://token.actions.githubusercontent.com" \
+            "${REF}"
+          cosign verify-attestation --type slsaprovenance \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/backend-ci\\.yml@.*$" \
+            --certificate-oidc-issuer    "https://token.actions.githubusercontent.com" \
+            "${REF}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/gh-actions-preview-provisioner
+          role-session-name: preview-${{ needs.should-provision.outputs.pr }}
+          aws-region: ${{ env.DEFAULT_REGION }}
+
+      - name: kubeconfig for preview cluster
+        run: aws eks update-kubeconfig --name "${{ env.PREVIEW_CLUSTER_NAME }}" --region "${{ env.DEFAULT_REGION }}"
+
+      - name: Compute namespace + host
+        id: ns
+        run: |
+          set -euo pipefail
+          PR="${{ needs.should-provision.outputs.pr }}"
+          NS="pr-${PR}"
+          HOST="pr-${PR}.${{ env.PREVIEW_BASE_DOMAIN }}"
+          echo "name=${NS}"  >> "$GITHUB_OUTPUT"
+          echo "host=${HOST}" >> "$GITHUB_OUTPUT"
+
+      - name: Create / patch namespace with ownership + TTL
+        run: |
+          set -euo pipefail
+          NS="${{ steps.ns.outputs.name }}"
+          PR="${{ needs.should-provision.outputs.pr }}"
+          OWNER=$(gh api "repos/${{ github.repository }}/pulls/${PR}" --jq '.user.login' 2>/dev/null || echo "${{ env.PLATFORM_OWNER }}")
+          cat <<YAML | kubectl apply -f -
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${NS}
+            labels:
+              platform.io/preview: "true"
+              platform.io/pr:      "${PR}"
+              platform.io/owner:   "${OWNER}"
+              app.kubernetes.io/managed-by: preview-env-workflow
+            annotations:
+              platform.io/ttl:         "${TTL}"
+              platform.io/owner:       "${OWNER}@${{ env.PLATFORM_EMAIL_DOMAIN }}"
+              platform.io/pr:          "${PR}"
+              platform.io/cost-center: "${{ env.PLATFORM_COST_CENTER }}"
+              platform.io/provisioned-by: "${{ env.PLATFORM_OWNER }}/preview-env.yml"
+              platform.io/host:        "${{ steps.ns.outputs.host }}"
+          YAML
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The preview NetworkPolicy overlay is user-supplied. Commit a file
+      # at k8s/preview/networkpolicy.yaml (or point PREVIEW_NETPOL_FILE at
+      # another path via repo Variables) and this step will render it with
+      # envsubst so references like $PREVIEW_INGRESS_NAMESPACE and
+      # $PREVIEW_METADATA_CIDR_EXCLUDE resolve to your cluster's values.
+      # If no overlay file exists, the step is skipped and the namespace
+      # has no policy - useful for clusters that enforce default-deny at
+      # a higher layer.
+      - name: Apply preview NetworkPolicy overlay (optional)
+        env:
+          PREVIEW_NETPOL_FILE:          ${{ vars.PREVIEW_NETPOL_FILE          || 'k8s/preview/networkpolicy.yaml' }}
+          PREVIEW_INGRESS_NAMESPACE:    ${{ vars.PREVIEW_INGRESS_NAMESPACE    || 'ingress-nginx' }}
+          PREVIEW_DNS_NAMESPACE:        ${{ vars.PREVIEW_DNS_NAMESPACE        || 'kube-system' }}
+          PREVIEW_METADATA_CIDR_EXCLUDE: ${{ vars.PREVIEW_METADATA_CIDR_EXCLUDE || '169.254.169.254/32' }}
+        run: |
+          set -euo pipefail
+          FILE="${PREVIEW_NETPOL_FILE}"
+          if [ ! -f "${FILE}" ]; then
+            echo "no NetworkPolicy overlay at ${FILE}; skipping"
+            exit 0
+          fi
+          envsubst < "${FILE}" | kubectl apply -n "${{ steps.ns.outputs.name }}" -f -
+
+      - name: Helm lint
+        run: helm lint charts/backend-template -f charts/backend-template/values.preview.yaml
+
+      - name: Helm upgrade --install (digest-pinned to the signed PR build)
+        run: |
+          set -euo pipefail
+          NS="${{ steps.ns.outputs.name }}"
+          HOST="${{ steps.ns.outputs.host }}"
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          IMAGE="${{ steps.digest.outputs.image }}"
+          PR="${{ needs.should-provision.outputs.pr }}"
+          RELEASE="${{ github.event.repository.name }}"
+
+          # fullnameOverride pins the deployment name to ${RELEASE} so the
+          # `rollout status` step below (and any external observer) can
+          # address it by a stable, predictable name.
+          helm upgrade --install "${RELEASE}" charts/backend-template \
+            --namespace "${NS}" \
+            --atomic \
+            --timeout 10m \
+            -f charts/backend-template/values.preview.yaml \
+            --set fullnameOverride="${RELEASE}" \
+            --set global.owner="${{ env.PLATFORM_OWNER }}" \
+            --set image.repository="${IMAGE}" \
+            --set image.digest="${DIGEST}" \
+            --set image.tag="pr-${PR}" \
+            --set ingress.className="${{ vars.PREVIEW_INGRESS_CLASS || 'nginx' }}" \
+            --set ingress.host="${HOST}" \
+            --set preview.enabled=true \
+            --set preview.pr="${PR}"
+
+      - name: Wait for readiness
+        run: |
+          set -euo pipefail
+          RELEASE="${{ github.event.repository.name }}"
+          kubectl -n "${{ steps.ns.outputs.name }}" rollout status \
+            deployment/"${RELEASE}" --timeout=5m
+
+      - name: Post preview URL to PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ needs.should-provision.outputs.pr }}" \
+            --repo "${{ github.repository }}" \
+            --body "Preview ready at https://${{ steps.ns.outputs.host }} - ns \`${{ steps.ns.outputs.name }}\` - digest \`${{ steps.digest.outputs.digest }}\` - TTL ${TTL}"
+
+  # ----------------------------------------------------------------------------
+  # TEARDOWN on PR close (merged or abandoned)
+  # ----------------------------------------------------------------------------
+  teardown:
+    name: Teardown preview env
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install kubectl (pinned)
+        run: |
+          set -euo pipefail
+          curl -sSL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/gh-actions-preview-provisioner
+          role-session-name: preview-teardown-${{ github.event.pull_request.number }}
+          aws-region: ${{ env.DEFAULT_REGION }}
+
+      - name: kubeconfig
+        run: aws eks update-kubeconfig --name "${{ env.PREVIEW_CLUSTER_NAME }}" --region "${{ env.DEFAULT_REGION }}"
+
+      - name: Delete namespace if present
+        run: |
+          set -euo pipefail
+          NS="pr-${{ github.event.pull_request.number }}"
+          if kubectl get ns "${NS}" >/dev/null 2>&1; then
+            kubectl delete namespace "${NS}" --wait=false
+            echo "namespace ${NS} deletion initiated"
+          else
+            echo "namespace ${NS} not found - already reaped"
+          fi
+
+      - name: Confirm teardown on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body "Preview namespace \`pr-${{ github.event.pull_request.number }}\` deleted."

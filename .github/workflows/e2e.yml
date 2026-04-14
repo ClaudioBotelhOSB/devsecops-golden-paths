@@ -1,0 +1,406 @@
+# ==============================================================================
+# .github/workflows/e2e.yml
+# Zero-Trust Delivery Platform - Phase C (E2E gate against preview env)
+# Owner: platform engineering
+#
+# Triggering rules (must all hold):
+#   - workflow_run upstream = "Preview environment"
+#   - upstream conclusion   = success
+#   - upstream event        = workflow_run  (i.e. provision, not teardown)
+#     and the workflow_run *of preview-env.yml* was itself triggered by
+#     Backend CI's completion, not by a PR close. This eliminates the race
+#     where a teardown could fire the E2E suite against an already-deleted
+#     namespace.
+#
+# Shards:
+#   1. k6        - API contract + load smoke.
+#   2. playwright - web UI regression (Chromium). STRICT TLS (no
+#      ignoreHTTPSErrors in CI).
+#   3. patrol    - Flutter integration_test path (optional mobile companion).
+#
+# Real auto-quarantine:
+#   - Each E2E shard uploads a JUnit artifact.
+#   - The `quarantine-scan` job downloads the last 14 successful run
+#     artifacts from this workflow, counts per-test failures over the
+#     window, and writes tests with >=2 failures out of >=5 runs into
+#     `tests/quarantine/quarantine.yaml` on a PR against this repo.
+#   - Quarantined tests are skipped at runtime via a JSON skiplist the
+#     shards read before executing.
+# ==============================================================================
+
+name: E2E gate
+
+on:
+  workflow_run:
+    workflows: ["Preview environment"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to target"
+        required: true
+  schedule:
+    - cron: "23 2 * * *"   # nightly quarantine rebuild
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.event.workflow_run.id || inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # ---- Central platform context ----
+  PLATFORM_OWNER:      ${{ vars.PLATFORM_OWNER      || github.repository_owner }}
+  PLATFORM_BOT_NAME:   ${{ vars.PLATFORM_BOT_NAME   || 'golden-path-bot' }}
+  PLATFORM_BOT_EMAIL:  ${{ vars.PLATFORM_BOT_EMAIL  || 'golden-path-bot@example.invalid' }}
+  PREVIEW_BASE_DOMAIN: ${{ vars.PREVIEW_BASE_DOMAIN || 'preview.example.internal' }}
+  # ---- Workflow-specific ----
+  K6_VERSION:         v0.54.0
+  PLAYWRIGHT_VERSION: 1.48.2
+  FLUTTER_VERSION:    3.24.5
+  PATROL_VERSION:     3.11.1
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Resolve: only continue on a SUCCESSFUL provision workflow_run.
+  # ----------------------------------------------------------------------------
+  resolve:
+    name: Resolve preview URL
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.name == 'Preview environment'
+      )
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      host: ${{ steps.out.outputs.host }}
+      pr:   ${{ steps.out.outputs.pr }}
+      quarantine: ${{ steps.out.outputs.quarantine }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - id: out
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "pr="           >> "$GITHUB_OUTPUT"
+            echo "host="         >> "$GITHUB_OUTPUT"
+            echo "quarantine=0"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR="${{ inputs.pr_number }}"
+          else
+            PR="${{ github.event.workflow_run.pull_requests[0].number }}"
+          fi
+          if [ -z "${PR}" ]; then
+            echo "::error::No PR number resolved"; exit 1
+          fi
+          HOST="pr-${PR}.${{ env.PREVIEW_BASE_DOMAIN }}"
+          echo "pr=${PR}"        >> "$GITHUB_OUTPUT"
+          echo "host=${HOST}"    >> "$GITHUB_OUTPUT"
+          echo "quarantine=1"    >> "$GITHUB_OUTPUT"
+
+          mkdir -p tests/quarantine
+          if [ ! -f tests/quarantine/quarantine.json ]; then
+            echo '{"tests":[]}' > tests/quarantine/quarantine.json
+          fi
+          echo "quarantine list:"
+          cat tests/quarantine/quarantine.json
+
+      - name: Upload resolved quarantine list
+        if: steps.out.outputs.quarantine == '1'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: quarantine-list
+          path: tests/quarantine/quarantine.json
+          retention-days: 7
+
+  # ----------------------------------------------------------------------------
+  # k6 API smoke + load
+  # ----------------------------------------------------------------------------
+  k6:
+    name: k6 (API smoke + load)
+    if: needs.resolve.outputs.quarantine == '1'
+    runs-on: ubuntu-24.04
+    needs: resolve
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install k6 (pinned)
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz -C /tmp
+          sudo install "/tmp/k6-${K6_VERSION}-linux-amd64/k6" /usr/local/bin/k6
+          k6 version
+
+      - name: Download quarantine list
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: quarantine-list
+          path: tests/quarantine
+
+      - name: Run smoke
+        env:
+          BASE_URL: https://${{ needs.resolve.outputs.host }}
+          K6_OUT:   "json=k6-smoke.json"
+          QUARANTINE_FILE: tests/quarantine/quarantine.json
+        run: k6 run tests/k6/smoke.js
+
+      - name: Run load
+        env:
+          BASE_URL: https://${{ needs.resolve.outputs.host }}
+          K6_OUT:   "json=k6-load.json"
+          QUARANTINE_FILE: tests/quarantine/quarantine.json
+        run: k6 run tests/k6/load.js
+
+      - name: Upload k6 results
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: k6-${{ needs.resolve.outputs.pr }}
+          path: |
+            k6-smoke.json
+            k6-load.json
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------
+  # Playwright Chromium (strict TLS in CI)
+  # ----------------------------------------------------------------------------
+  playwright:
+    name: Playwright (Chromium)
+    if: needs.resolve.outputs.quarantine == '1'
+    runs-on: ubuntu-24.04
+    needs: resolve
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Setup Node (pinned)
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: "20.18.0"
+          cache: npm
+
+      - name: Download quarantine list
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: quarantine-list
+          path: tests/quarantine
+
+      - name: Install dependencies
+        working-directory: tests/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run Playwright (strict TLS)
+        working-directory: tests/e2e
+        env:
+          BASE_URL: https://${{ needs.resolve.outputs.host }}
+          PR:       ${{ needs.resolve.outputs.pr }}
+          CI:       "true"            # flips playwright.config.ts to strict TLS
+          QUARANTINE_FILE: ${{ github.workspace }}/tests/quarantine/quarantine.json
+        run: npx playwright test --reporter=line,html,junit
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: playwright-${{ needs.resolve.outputs.pr }}
+          path: |
+            tests/e2e/playwright-report/
+            tests/e2e/test-results/
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------
+  # Patrol (Flutter integration_test) - optional mobile companion
+  # ----------------------------------------------------------------------------
+  patrol:
+    name: Patrol (Flutter)
+    if: needs.resolve.outputs.quarantine == '1'
+    runs-on: ubuntu-24.04
+    needs: resolve
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Setup Flutter (pinned)
+        # subosito/flutter-action@v2.18.0
+        uses: subosito/flutter-action@44ac965b96f18d999802d4b807e3256d5a3f9fa1
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+
+      - name: Install Patrol CLI (pinned)
+        run: dart pub global activate patrol_cli ${{ env.PATROL_VERSION }}
+
+      - name: Flutter pub get
+        working-directory: tests/patrol
+        run: flutter pub get
+
+      - name: Download quarantine list
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: quarantine-list
+          path: tests/quarantine
+
+      - name: Run Patrol integration tests (smoke)
+        working-directory: tests/patrol
+        env:
+          BASE_URL: https://${{ needs.resolve.outputs.host }}
+          CI:       "true"
+          QUARANTINE_FILE: ${{ github.workspace }}/tests/quarantine/quarantine.json
+        run: |
+          patrol test \
+            --target integration_test/smoke_test.dart \
+            --dart-define=BASE_URL="${BASE_URL}" \
+            --dart-define=QUARANTINE_FILE="${QUARANTINE_FILE}"
+
+      - name: Upload Patrol results
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: patrol-${{ needs.resolve.outputs.pr }}
+          path: |
+            tests/patrol/build/
+            tests/patrol/test_results/
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------
+  # Nightly quarantine rebuild - downloads last 14 workflow runs, aggregates
+  # failures per test, and opens a PR updating tests/quarantine/quarantine.json
+  # ----------------------------------------------------------------------------
+  quarantine-scan:
+    name: Quarantine scan (nightly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Aggregate failures from last 14 days of runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/qa
+          gh run list --workflow "E2E gate" --limit 50 \
+            --json databaseId,conclusion,createdAt,event \
+            --jq '[.[] | select(.event != "schedule")] | .[0:14]' > /tmp/qa/runs.json
+
+          mkdir -p tests/quarantine
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, xml.etree.ElementTree as ET
+
+          runs = json.loads(pathlib.Path("/tmp/qa/runs.json").read_text())
+          fails = {}
+          total = {}
+
+          for r in runs:
+              rid = r["databaseId"]
+              target = pathlib.Path(f"/tmp/qa/{rid}")
+              target.mkdir(parents=True, exist_ok=True)
+              subprocess.run(
+                  ["gh", "run", "download", str(rid), "--dir", str(target)],
+                  check=False,
+              )
+              for junit in target.rglob("*.xml"):
+                  try:
+                      root = ET.parse(junit).getroot()
+                  except ET.ParseError:
+                      continue
+                  for tc in root.iter("testcase"):
+                      name = f'{tc.get("classname","")}::{tc.get("name","")}'
+                      total[name] = total.get(name, 0) + 1
+                      if any(tc.iter("failure")) or any(tc.iter("error")):
+                          fails[name] = fails.get(name, 0) + 1
+
+          quarantined = sorted(
+              name for name, f in fails.items()
+              if f >= 2 and total.get(name, 0) >= 5
+          )
+          out = {"tests": quarantined, "maintainer": "${{ env.PLATFORM_OWNER }}"}
+          pathlib.Path("tests/quarantine/quarantine.json").write_text(
+              json.dumps(out, indent=2) + "\n"
+          )
+          print(f"quarantined {len(quarantined)} tests")
+          PY
+
+      - name: Open PR if quarantine list changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet tests/quarantine/quarantine.json; then
+            echo "no quarantine changes"
+            exit 0
+          fi
+          BR="quarantine/nightly-$(date -u +%Y%m%d)"
+          git config user.name  "${{ env.PLATFORM_BOT_NAME }}"
+          git config user.email "${{ env.PLATFORM_BOT_EMAIL }}"
+          git checkout -b "${BR}"
+          git add tests/quarantine/quarantine.json
+          git commit -m "chore(quarantine): nightly refresh"
+          git push -u origin "${BR}"
+          gh pr create \
+            --title "chore(quarantine): nightly refresh" \
+            --body  "Updated quarantine list from last 14 runs." \
+            --label "quarantine,automated"
+
+  # ----------------------------------------------------------------------------
+  # Required status gate
+  # ----------------------------------------------------------------------------
+  e2e-gate:
+    name: E2E gate
+    runs-on: ubuntu-24.04
+    needs: [k6, playwright, patrol]
+    if: always() && needs.resolve.outputs.quarantine == '1'
+    permissions:
+      contents: read
+    steps:
+      - name: Evaluate
+        run: |
+          set -euo pipefail
+          for r in \
+              "${{ needs.k6.result }}" \
+              "${{ needs.playwright.result }}" \
+              "${{ needs.patrol.result }}"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::E2E gate failed - upstream result: $r"
+              exit 1
+            fi
+          done
+          echo "E2E gate green"

@@ -1,0 +1,744 @@
+# ==============================================================================
+# .github/workflows/backend-ci.yml
+# Zero-Trust Delivery Platform - Phase B/C (Go Backend)
+# Owner: platform engineering
+#
+# What this pipeline actually builds
+# -----------------------------------
+# This template ships TWO Go binaries by default, each in its own cmd/ dir:
+#
+#   * cmd/api        -> the user-facing HTTP API (primary workload;
+#                       Argo Rollouts, canary analysis, preview env, and
+#                       E2E suite all validate this one)
+#   * cmd/ttl-reaper -> the preview-environment namespace reaper
+#
+# Rename the matrix entries under `build-sign.strategy.matrix` to match your
+# actual cmd/ subdirectories. The image name is derived from
+# `${{ github.event.repository.name }}` so you do NOT need to hardcode it.
+#
+# Both entries are built, SBOM'd, signed, and attested in parallel. Each
+# produces its own image digest, exposed as a job output so downstream
+# workflows (preview-env.yml, e2e.yml) can consume the exact signed digest.
+#
+# PR vs push
+# ----------
+# - On pull_request: build-sign runs, pushes an EPHEMERAL `pr-<N>` tag,
+#   signs it, and emits its digest as an output. The preview environment
+#   consumes THAT digest. The GitOps bump is skipped.
+# - On push/merge_group: same thing plus a stable `sha-<LONG>` tag and a
+#   GitOps manifest bump PR. A GitHub Deployment + `deployment_status`
+#   events are emitted so dora-emit.yml can compute deployment frequency
+#   and change failure rate from real signals.
+#
+# Hard-fail gates (no soft-fail anywhere):
+#   - gosec (blocking, exit=1 on HIGH+)
+#   - trivy fs + trivy image (blocking)
+#   - sonar quality gate
+#   - cosign verify + verify-attestation spdxjson + slsaprovenance
+# ==============================================================================
+
+name: Backend CI (Go)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'charts/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '.github/workflows/backend-ci.yml'
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ---- Central platform context (customize via repository Variables) ----
+  PLATFORM_OWNER:        ${{ vars.PLATFORM_OWNER        || github.repository_owner }}
+  PLATFORM_BOT_NAME:     ${{ vars.PLATFORM_BOT_NAME     || 'golden-path-bot' }}
+  PLATFORM_BOT_EMAIL:    ${{ vars.PLATFORM_BOT_EMAIL    || 'golden-path-bot@example.invalid' }}
+  PLATFORM_EMAIL_DOMAIN: ${{ vars.PLATFORM_EMAIL_DOMAIN || 'example.internal' }}
+  OCI_REGISTRY:          ${{ vars.OCI_REGISTRY          || 'ghcr.io' }}
+  OCI_VENDOR:            ${{ vars.OCI_VENDOR            || github.repository_owner }}
+  OCI_AUTHORS:           ${{ vars.OCI_AUTHORS           || 'golden-path-bot@example.invalid' }}
+  # ---- Workflow-specific ----
+  GO_VERSION: "1.23.3"
+  GOFLAGS: "-buildvcs=false"
+  REGISTRY: ${{ vars.OCI_REGISTRY || 'ghcr.io' }}
+  COSIGN_EXPERIMENTAL: "1"
+  COSIGN_YES: "true"
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # LINT
+  # ----------------------------------------------------------------------------
+  lint:
+    name: Lint (golangci-lint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache go build + mod
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-lint-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-lint-${{ runner.os }}-
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@971e284b6050e8a5849b72094c50ab08da042db8
+        with:
+          version: v1.62.0
+          args: --timeout=6m
+
+      - name: go mod tidy (check)
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  # ----------------------------------------------------------------------------
+  # TEST
+  # ----------------------------------------------------------------------------
+  test:
+    name: Test (${{ github.event_name == 'pull_request' && 'delta' || 'full' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache go build + mod
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-test-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-test-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
+            go-test-${{ runner.os }}-
+
+      - name: Determine test scope
+        id: scope
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only \
+              "origin/${{ github.base_ref }}...HEAD" \
+              | grep '\.go$' | xargs -r -n1 dirname | sort -u \
+              | sed 's|^|./|' | tr '\n' ' ')
+            if [ -z "${CHANGED}" ]; then
+              CHANGED="./..."
+            fi
+          else
+            CHANGED="./..."
+          fi
+          echo "pkgs=${CHANGED}" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned go-junit-report
+        run: go install github.com/jstemmer/go-junit-report/v2@v2.1.0
+
+      - name: go test
+        run: |
+          set -euo pipefail
+          go test \
+            -race \
+            -count=1 \
+            -timeout=10m \
+            -covermode=atomic \
+            -coverprofile=coverage.out \
+            -json \
+            ${{ steps.scope.outputs.pkgs }} | tee test-report.json
+
+      - name: Convert to JUnit
+        if: always()
+        run: go-junit-report -parser gojson -in test-report.json -out junit.xml || true
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: test-report-${{ github.run_id }}
+          path: |
+            coverage.out
+            test-report.json
+            junit.xml
+          retention-days: 7
+
+  # ----------------------------------------------------------------------------
+  # SAST - gosec BLOCKING + SonarQube PR/branch split
+  # ----------------------------------------------------------------------------
+  sast:
+    name: SAST (gosec + SonarQube)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [test]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Download coverage
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: test-report-${{ github.run_id }}
+
+      - name: Install gosec (pinned)
+        run: |
+          set -euo pipefail
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+          "$(go env GOPATH)/bin/gosec" -version
+
+      # gosec is BLOCKING. Any MEDIUM+ finding exits the job non-zero and the
+      # SAST gate fails. The SARIF is still uploaded for audit even on failure.
+      - name: Run gosec (blocking)
+        id: gosec
+        run: |
+          set -euo pipefail
+          "$(go env GOPATH)/bin/gosec" \
+            -severity=medium \
+            -confidence=medium \
+            -fmt=sarif \
+            -out=gosec.sarif \
+            -no-fail=false \
+            ./...
+
+      - name: Upload gosec SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+      - name: SonarQube - PR path
+        if: github.event_name == 'pull_request'
+        uses: SonarSource/sonarqube-scan-action@aa494459d7c39c106cc77b166de8b4250a32bb97
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.event.repository.name }}
+            -Dsonar.organization=${{ github.repository_owner }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/vendor/**,**/mocks/**,**/testdata/**
+            -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.go.tests.reportPaths=junit.xml
+            -Dsonar.pullrequest.key=${{ github.event.pull_request.number }}
+            -Dsonar.pullrequest.branch=${{ github.head_ref }}
+            -Dsonar.pullrequest.base=${{ github.base_ref }}
+            -Dsonar.qualitygate.wait=true
+
+      - name: SonarQube - branch path
+        if: github.event_name != 'pull_request'
+        uses: SonarSource/sonarqube-scan-action@aa494459d7c39c106cc77b166de8b4250a32bb97
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.event.repository.name }}
+            -Dsonar.organization=${{ github.repository_owner }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/vendor/**,**/mocks/**,**/testdata/**
+            -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.go.tests.reportPaths=junit.xml
+            -Dsonar.branch.name=${{ github.ref_name }}
+            -Dsonar.qualitygate.wait=true
+
+  # ----------------------------------------------------------------------------
+  # Trivy filesystem scan (repo + deps)
+  # ----------------------------------------------------------------------------
+  trivy-fs:
+    name: Trivy (fs + config)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Trivy fs scan
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: '1'
+
+      - name: Upload Trivy fs SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # ----------------------------------------------------------------------------
+  # BUILD + SBOM + SIGN  -- matrix over apps found under cmd/
+  # Runs on PR, push, AND merge_group. PRs produce ephemeral `pr-<N>` tags
+  # that preview-env.yml consumes by digest.
+  #
+  # `app` is the logical service name (used as an image suffix + label),
+  # `cmd` is the cmd/<dir> that `docker build --build-arg CMD=$cmd` compiles.
+  # The PRIMARY service MUST be `api` so downstream workflows can look up
+  # `build-sign.outputs.primary_digest` without guessing a per-repo suffix.
+  # ----------------------------------------------------------------------------
+  build-sign:
+    name: Build+Sign (${{ matrix.app }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: [lint, test, sast, trivy-fs]
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: api
+            cmd: api
+            primary: "true"
+          - app: ttl-reaper
+            cmd: ttl-reaper
+            primary: "false"
+    # Matrix jobs cannot reliably share outputs (all entries overwrite each
+    # other), so downstream jobs read the digest via the `digest-<app>-<sha>`
+    # artifact uploaded below.
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349
+
+      # Registry login has two paths:
+      #   - GHCR: reuse the workflow's GitHub token (no extra secrets)
+      #   - Any other registry: require OCI_USERNAME + OCI_PASSWORD secrets
+      - name: Login to GHCR
+        if: env.REGISTRY == 'ghcr.io'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to external OCI registry
+        if: env.REGISTRY != 'ghcr.io'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.OCI_USERNAME }}
+          password: ${{ secrets.OCI_PASSWORD }}
+
+      - name: Compute image name (dynamic from repository)
+        id: img
+        run: |
+          set -euo pipefail
+          # ghcr.io/<owner>/<repo>/<app>   e.g. ghcr.io/acme/my-service/api
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_LC=$(echo  "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          APP_LC=$(echo   "${{ matrix.app }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="${{ env.REGISTRY }}/${OWNER_LC}/${REPO_LC}/${APP_LC}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "resolved image: ${IMAGE}"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96
+        with:
+          images: ${{ steps.img.outputs.image }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.app }}
+            org.opencontainers.image.vendor=platform
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.authors=${{ env.OCI_AUTHORS }}
+
+      - name: Build & push (reproducible, provenance, SBOM)
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_USER=${{ env.PLATFORM_OWNER }}
+            CMD=${{ matrix.cmd }}
+
+      - name: Resolve canonical ref
+        id: ref
+        run: |
+          IMAGE_REF="${{ steps.img.outputs.image }}@${{ steps.build.outputs.digest }}"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "${IMAGE_REF}"
+
+      - name: Trivy image scan (BLOCKING)
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2
+        with:
+          image-ref: ${{ steps.ref.outputs.image_ref }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image-${{ matrix.app }}.sarif
+          exit-code: '1'
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88
+        with:
+          sarif_file: trivy-image-${{ matrix.app }}.sarif
+          category: trivy-image-${{ matrix.app }}
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0
+
+      - name: Generate SBOMs
+        run: |
+          syft "${{ steps.ref.outputs.image_ref }}" \
+            -o spdx-json=sbom.${{ matrix.app }}.spdx.json \
+            -o cyclonedx-json=sbom.${{ matrix.app }}.cdx.json
+
+      - name: Install Cosign (pinned)
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da
+        with:
+          cosign-release: v2.4.1
+
+      - name: Cosign sign image
+        run: |
+          cosign sign --yes "${{ steps.ref.outputs.image_ref }}"
+
+      - name: Cosign attest SPDX SBOM
+        run: |
+          cosign attest --yes \
+            --predicate sbom.${{ matrix.app }}.spdx.json \
+            --type spdxjson \
+            "${{ steps.ref.outputs.image_ref }}"
+
+      - name: Cosign attest CycloneDX SBOM
+        run: |
+          cosign attest --yes \
+            --predicate sbom.${{ matrix.app }}.cdx.json \
+            --type cyclonedx \
+            "${{ steps.ref.outputs.image_ref }}"
+
+      - name: Generate SLSA v1 provenance predicate
+        run: |
+          cat > provenance.${{ matrix.app }}.json <<EOF
+          {
+            "buildType": "https://github.com/actions/runner/buildTypes/v1",
+            "builder": { "id": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" },
+            "invocation": {
+              "configSource": {
+                "uri":        "git+${{ github.server_url }}/${{ github.repository }}@${{ github.ref }}",
+                "digest":     { "sha1": "${{ github.sha }}" },
+                "entryPoint": ".github/workflows/backend-ci.yml"
+              },
+              "parameters": { "user": "${{ env.PLATFORM_OWNER }}", "app": "${{ matrix.app }}", "cmd": "${{ matrix.cmd }}" }
+            },
+            "metadata": {
+              "buildInvocationID": "${{ github.run_id }}",
+              "completeness": { "parameters": true, "environment": false, "materials": true },
+              "reproducible": false
+            },
+            "materials": [
+              { "uri": "git+${{ github.server_url }}/${{ github.repository }}", "digest": { "sha1": "${{ github.sha }}" } }
+            ]
+          }
+          EOF
+
+      - name: Cosign attest SLSA provenance
+        run: |
+          cosign attest --yes \
+            --predicate provenance.${{ matrix.app }}.json \
+            --type slsaprovenance \
+            "${{ steps.ref.outputs.image_ref }}"
+
+      # ------------------------------------------------------------------
+      # Local verification: signature + BOTH attestations. Blocks handoff.
+      # ------------------------------------------------------------------
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/backend-ci\\.yml@.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ steps.ref.outputs.image_ref }}" | tee verify-sig-${{ matrix.app }}.json
+
+      - name: Verify SPDX SBOM attestation
+        run: |
+          cosign verify-attestation \
+            --type spdxjson \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/backend-ci\\.yml@.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ steps.ref.outputs.image_ref }}" | tee verify-spdx-${{ matrix.app }}.json
+
+      - name: Verify SLSA provenance attestation
+        run: |
+          cosign verify-attestation \
+            --type slsaprovenance \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/backend-ci\\.yml@.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ steps.ref.outputs.image_ref }}" | tee verify-slsa-${{ matrix.app }}.json
+
+      - name: Echo primary marker
+        if: matrix.primary == 'true'
+        run: |
+          echo "primary digest=${{ steps.build.outputs.digest }}"
+          echo "primary image=${{ steps.img.outputs.image }}"
+
+      - name: Upload SBOMs + attestations
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: sbom-${{ matrix.app }}-${{ github.sha }}
+          path: |
+            sbom.${{ matrix.app }}.spdx.json
+            sbom.${{ matrix.app }}.cdx.json
+            provenance.${{ matrix.app }}.json
+            verify-sig-${{ matrix.app }}.json
+            verify-spdx-${{ matrix.app }}.json
+            verify-slsa-${{ matrix.app }}.json
+          retention-days: 90
+
+      - name: Write digest pointer artifact
+        run: |
+          jq -n \
+            --arg app     "${{ matrix.app }}" \
+            --arg primary "${{ matrix.primary }}" \
+            --arg image   "${{ steps.img.outputs.image }}" \
+            --arg digest  "${{ steps.build.outputs.digest }}" \
+            --arg ref     "${{ steps.ref.outputs.image_ref }}" \
+            --arg repo    "${{ github.event.repository.name }}" \
+            '{app:$app,primary:($primary=="true"),image:$image,digest:$digest,ref:$ref,repo:$repo,maintainer:"${{ env.PLATFORM_OWNER }}"}' \
+            > digest-${{ matrix.app }}.json
+
+      - name: Upload digest pointer
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: digest-${{ matrix.app }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: digest-${{ matrix.app }}.json
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------
+  # Create GitHub Deployment + status on EVERY main-branch build, regardless
+  # of build-sign outcome. This is what dora-emit.yml subscribes to for
+  # deployment frequency (state=success) and change failure rate (state!=success).
+  # ----------------------------------------------------------------------------
+  deployment-event:
+    name: Create GitHub Deployment
+    runs-on: ubuntu-24.04
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-sign]
+    permissions:
+      contents: read
+      actions: read
+      deployments: write
+    steps:
+      - name: Resolve state
+        id: state
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.build-sign.result }}" = "success" ]; then
+            echo "state=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download primary digest pointer
+        if: steps.state.outputs.state == 'success'
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: digest-api-${{ github.sha }}
+          path: ./digest
+
+      - name: Read primary digest
+        id: digest
+        if: steps.state.outputs.state == 'success'
+        run: |
+          set -euo pipefail
+          DIGEST=$(jq -r '.digest' digest/digest-api.json)
+          IMAGE=$(jq -r '.image' digest/digest-api.json)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}"   >> "$GITHUB_OUTPUT"
+
+      - name: Create deployment + status (${{ steps.state.outputs.state }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST:   ${{ steps.digest.outputs.digest }}
+          IMAGE:    ${{ steps.digest.outputs.image }}
+        run: |
+          set -euo pipefail
+          DEP_ID=$(gh api \
+            -X POST \
+            "repos/${{ github.repository }}/deployments" \
+            -f ref="${{ github.sha }}" \
+            -f environment="staging" \
+            -f description="${{ github.event.repository.name }} build ${{ github.run_id }}" \
+            -F auto_merge=false \
+            -f required_contexts[] \
+            --jq '.id')
+
+          gh api \
+            -X POST \
+            "repos/${{ github.repository }}/deployments/${DEP_ID}/statuses" \
+            -f state="${{ steps.state.outputs.state }}" \
+            -f description="${IMAGE:-${{ github.event.repository.name }}}@${DIGEST:-unknown}" \
+            -f environment="staging" \
+            -f log_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  # ----------------------------------------------------------------------------
+  # GITOPS manifest bump (push path only). Uses the primary digest pointer.
+  # Adjust GITOPS_REPO + GITOPS_PATH to point at your manifest repo layout.
+  # ----------------------------------------------------------------------------
+  gitops-bump:
+    name: GitOps manifest bump
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-sign]
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GITOPS_REPO: ${{ vars.GITOPS_REPO || format('{0}/platform-gitops', github.repository_owner) }}
+      GITOPS_PATH: ${{ vars.GITOPS_PATH || format('apps/{0}/staging/values.yaml', github.event.repository.name) }}
+    steps:
+      - name: Checkout manifest repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+          persist-credentials: true
+
+      - name: Download primary digest pointer
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: digest-api-${{ github.sha }}
+          path: ./digest
+
+      - name: Update image digest
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          DIGEST=$(jq -r '.digest' ../digest/digest-api.json)
+          IMAGE=$(jq -r '.image'  ../digest/digest-api.json)
+          yq -i ".image.repository = \"${IMAGE}\""       "${GITOPS_PATH}"
+          yq -i ".image.digest     = \"${DIGEST}\""      "${GITOPS_PATH}"
+          yq -i ".image.tag        = \"sha-${GITHUB_SHA}\"" "${GITOPS_PATH}"
+
+      - name: Open PR against manifest repo
+        working-directory: gitops
+        run: |
+          SERVICE="${{ github.event.repository.name }}"
+          BR="bump/${SERVICE}-${GITHUB_SHA::12}"
+          git config user.name  "${{ env.PLATFORM_BOT_NAME }}"
+          git config user.email "${{ env.PLATFORM_BOT_EMAIL }}"
+          git checkout -b "${BR}"
+          git add -A
+          git commit -m "chore(${SERVICE}): bump to ${GITHUB_SHA::12}"
+          git push origin "${BR}"
+          gh pr create \
+            --title "chore(${SERVICE}): bump to ${GITHUB_SHA::12}" \
+            --body  "Automated digest bump from backend-ci run ${GITHUB_RUN_ID}. Image signed and attestations (SPDX + SLSA) locally verified by ${{ env.PLATFORM_OWNER }}." \
+            --label "auto-merge,staging"
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+
+  # ----------------------------------------------------------------------------
+  # Required status gate
+  # ----------------------------------------------------------------------------
+  backend-gate:
+    name: Backend CI gate
+    runs-on: ubuntu-24.04
+    if: always()
+    needs: [lint, test, sast, trivy-fs, build-sign]
+    permissions:
+      contents: read
+    steps:
+      - name: Evaluate
+        run: |
+          set -euo pipefail
+          for r in \
+              "${{ needs.lint.result }}" \
+              "${{ needs.test.result }}" \
+              "${{ needs.sast.result }}" \
+              "${{ needs.trivy-fs.result }}" \
+              "${{ needs.build-sign.result }}"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::Backend CI gate failed - upstream result: $r"
+              exit 1
+            fi
+          done
+          echo "Backend CI gate green"

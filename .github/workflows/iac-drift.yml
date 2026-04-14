@@ -1,0 +1,189 @@
+# ==============================================================================
+# .github/workflows/iac-drift.yml
+# Zero-Trust Delivery Platform - Drift Detection
+# Owner: platform engineering
+#
+# Every 6 hours this workflow runs `terraform plan -detailed-exitcode` against
+# every managed environment. Exit code semantics:
+#
+#   0 -> no changes            (drift_clean metric bumped)
+#   1 -> error                 (reconcile_errors bumped, issue filed)
+#   2 -> drift detected        (incident opened + Slack alert + PR comment)
+#
+# Drift is how you eliminate shadow IT. Not by policy memos; by a job that
+# runs every six hours and refuses to be quiet.
+# ==============================================================================
+
+name: IaC - Drift detection
+
+on:
+  schedule:
+    - cron: "7 */6 * * *"         # 00:07, 06:07, 12:07, 18:07 UTC
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Only this environment (blank = all)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iac-drift
+  cancel-in-progress: false
+
+env:
+  # ---- Central platform context ----
+  PLATFORM_OWNER: ${{ vars.PLATFORM_OWNER || github.repository_owner }}
+  DEFAULT_REGION: ${{ vars.DEFAULT_REGION || 'us-east-1' }}
+  # ---- Workflow-specific ----
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  matrix:
+    name: Discover environments
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      envs: ${{ steps.set.outputs.envs }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - id: set
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.env }}" ]; then
+            echo "envs=[\"${{ inputs.env }}\"]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t ENVS < <(find terraform/environments -maxdepth 1 -mindepth 1 -type d -exec basename {} \;)
+          JSON=$(printf '%s\n' "${ENVS[@]}" | jq -R . | jq -sc .)
+          echo "envs=${JSON}" >> "$GITHUB_OUTPUT"
+
+  detect:
+    name: Detect drift (${{ matrix.env }})
+    runs-on: ubuntu-24.04
+    needs: matrix
+    permissions:
+      contents: read
+      id-token: write
+      issues: write          # open incident ticket
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.matrix.outputs.envs) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC, read-only)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/gh-actions-tf-drift-${{ matrix.env }}
+          role-session-name: gh-iac-drift-${{ github.run_id }}
+          aws-region: ${{ env.DEFAULT_REGION }}
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config=backends/${{ matrix.env }}.hcl \
+            -lockfile=readonly
+
+      - name: Terraform plan -detailed-exitcode
+        id: plan
+        working-directory: terraform
+        run: |
+          set +e
+          terraform plan \
+            -var-file=environments/${{ matrix.env }}.tfvars \
+            -detailed-exitcode \
+            -no-color \
+            -out=drift.${{ matrix.env }}.binary \
+            > plan-stdout.txt 2>&1
+          EXIT=$?
+          set -e
+          echo "exitcode=${EXIT}" >> "$GITHUB_OUTPUT"
+          cat plan-stdout.txt
+
+      - name: Emit drift metric (success path)
+        if: steps.plan.outputs.exitcode == '0'
+        run: |
+          echo "::notice title=drift clean::${{ matrix.env }} - no drift"
+          curl -fsS -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"metric\":\"iac_drift_clean\",\"env\":\"${{ matrix.env }}\",\"value\":1,\"ts\":\"$(date -u +%s)\"}" \
+            "${PUSHGATEWAY_URL:-http://localhost:9091/dummy}" || true
+
+      - name: Open incident on drift
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          ENV="${{ matrix.env }}"
+          SUMMARY=$(head -c 60000 plan-stdout.txt)
+          TITLE="IaC drift detected in ${ENV}"
+          BODY=$(cat <<EOF
+          ## Drift detected
+
+          - **environment**: \`${ENV}\`
+          - **detected at**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          - **upstream run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - **owner**: ${{ env.PLATFORM_OWNER }}
+
+          ### Resolution paths
+          1. **Codify**  - open a PR that absorbs the observed drift into Terraform.
+          2. **Revert**  - run \`terraform apply\` via the signed-plan pipeline
+             to restore desired state.
+
+          <details><summary>Plan output (truncated)</summary>
+
+          \`\`\`
+          ${SUMMARY}
+          \`\`\`
+          </details>
+          EOF
+          )
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "${TITLE}" \
+            --label "incident,drift,env:${ENV}" \
+            --body  "${BODY}"
+
+      - name: Slack alert on drift
+        if: steps.plan.outputs.exitcode == '2' && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            -d "{\"text\":\"IaC drift detected in \`${{ matrix.env }}\`. See run ${{ github.run_id }}\"}" \
+            "${SLACK_WEBHOOK_URL}"
+
+      - name: Fail job on hard error
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error title=Drift plan failed::terraform plan errored for ${{ matrix.env }}"
+          exit 1
+
+      - name: Upload drift evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: drift-${{ matrix.env }}-${{ github.run_id }}
+          path: |
+            terraform/plan-stdout.txt
+            terraform/drift.${{ matrix.env }}.binary
+          retention-days: 30

@@ -1,0 +1,253 @@
+# ==============================================================================
+# .github/workflows/dora-emit.yml
+# Zero-Trust Delivery Platform - DORA metrics emitter
+# Owner: platform engineering
+#
+# Emits the four DORA metrics as first-class events from pipeline telemetry,
+# not from a quarterly survey. Output is one JSON line per event, pushed to:
+#
+#   1. The event bus   (HTTP POST to $DORA_ENDPOINT)
+#   2. A GitHub Actions summary (for humans tailing a run)
+#   3. An artifact     (retention 365d, audit trail)
+#
+# Events:
+#   * lead_time_for_changes  -> on pull_request.closed(merged)
+#   * deployment_frequency   -> on deployment_status.success
+#   * change_failure_rate    -> on deployment_status.failure / rollback event
+#   * mttr                   -> on issue labeled `incident` being closed
+#
+# The emitter is intentionally hostless - point DORA_ENDPOINT at your
+# Prometheus Pushgateway, Grafana OnCall, or internal events bus.
+# ==============================================================================
+
+name: DORA emitter
+
+on:
+  pull_request:
+    types: [closed]
+  deployment_status:
+  issues:
+    types: [closed, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dora-emit-${{ github.event_name }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  # ---- Central platform context ----
+  PLATFORM_OWNER: ${{ vars.PLATFORM_OWNER || github.repository_owner }}
+  # ---- Workflow-specific ----
+  DORA_ENDPOINT:  ${{ secrets.DORA_ENDPOINT }}
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Lead time for changes (PR merged)
+  # ----------------------------------------------------------------------------
+  lead-time:
+    name: Emit lead_time_for_changes
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compute lead time
+        id: lt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR="${{ github.event.pull_request.number }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          FIRST_COMMIT_TS=$(git log --reverse --format=%aI "${{ github.event.pull_request.base.sha }}..${HEAD}" | head -1)
+          MERGE_TS="${{ github.event.pull_request.merged_at }}"
+
+          if [ -z "${FIRST_COMMIT_TS}" ]; then
+            FIRST_COMMIT_TS="${{ github.event.pull_request.created_at }}"
+          fi
+
+          LEAD_SECONDS=$(python3 - <<PY
+          from datetime import datetime
+          a = datetime.fromisoformat("${FIRST_COMMIT_TS}".replace("Z","+00:00"))
+          b = datetime.fromisoformat("${MERGE_TS}".replace("Z","+00:00"))
+          print(int((b - a).total_seconds()))
+          PY
+          )
+
+          cat <<EOF | tee lead-time.json
+          {
+            "metric":   "dora.lead_time_for_changes",
+            "pr":       ${PR},
+            "service":  "${{ github.event.repository.name }}",
+            "team":     "platform",
+            "first_commit_ts": "${FIRST_COMMIT_TS}",
+            "merge_ts":        "${MERGE_TS}",
+            "lead_seconds":    ${LEAD_SECONDS},
+            "actor":    "${{ github.actor }}",
+            "maintainer": "${{ env.PLATFORM_OWNER }}"
+          }
+          EOF
+          echo "lead_seconds=${LEAD_SECONDS}" >> "$GITHUB_OUTPUT"
+
+      - name: Push event
+        if: env.DORA_ENDPOINT != ''
+        run: |
+          curl -fsS -X POST "${DORA_ENDPOINT}/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "X-Platform-User: ${{ env.PLATFORM_OWNER }}" \
+            --data-binary @lead-time.json
+
+      - name: Summary
+        run: |
+          {
+            echo "### DORA: lead time for changes"
+            echo ""
+            echo "- PR:  #${{ github.event.pull_request.number }}"
+            echo "- lead: **${{ steps.lt.outputs.lead_seconds }}s**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: dora-lead-time-${{ github.event.pull_request.number }}
+          path: lead-time.json
+          retention-days: 365
+
+  # ----------------------------------------------------------------------------
+  # Deployment frequency + change failure rate
+  # ----------------------------------------------------------------------------
+  deployment:
+    name: Emit deployment_{frequency,failure_rate}
+    if: github.event_name == 'deployment_status'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Build event
+        id: ev
+        run: |
+          set -euo pipefail
+          STATE="${{ github.event.deployment_status.state }}"
+          ENV="${{ github.event.deployment.environment }}"
+          SHA="${{ github.event.deployment.sha }}"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          METRIC="dora.deployment_frequency"
+          SUCCESS=1
+          if [ "${STATE}" != "success" ]; then
+            METRIC="dora.change_failure_rate"
+            SUCCESS=0
+          fi
+
+          cat <<EOF | tee deployment-event.json
+          {
+            "metric":    "${METRIC}",
+            "env":       "${ENV}",
+            "sha":       "${SHA}",
+            "state":     "${STATE}",
+            "success":   ${SUCCESS},
+            "ts":        "${TS}",
+            "service":   "${{ github.event.repository.name }}",
+            "actor":     "${{ github.actor }}",
+            "maintainer": "${{ env.PLATFORM_OWNER }}"
+          }
+          EOF
+
+      - name: Push event
+        if: env.DORA_ENDPOINT != ''
+        run: |
+          curl -fsS -X POST "${DORA_ENDPOINT}/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "X-Platform-User: ${{ env.PLATFORM_OWNER }}" \
+            --data-binary @deployment-event.json
+
+      - name: Summary
+        run: |
+          {
+            echo "### DORA: deployment event"
+            echo ""
+            cat deployment-event.json | jq .
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: dora-deployment-${{ github.run_id }}
+          path: deployment-event.json
+          retention-days: 365
+
+  # ----------------------------------------------------------------------------
+  # MTTR (incident issue closed)
+  # ----------------------------------------------------------------------------
+  mttr:
+    name: Emit mttr
+    if: >
+      github.event_name == 'issues' &&
+      github.event.action == 'closed' &&
+      contains(join(github.event.issue.labels.*.name, ','), 'incident')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Compute MTTR
+        id: mttr
+        run: |
+          set -euo pipefail
+          OPEN="${{ github.event.issue.created_at }}"
+          CLOSE="${{ github.event.issue.closed_at }}"
+          MTTR_SECONDS=$(python3 - <<PY
+          from datetime import datetime
+          a = datetime.fromisoformat("${OPEN}".replace("Z","+00:00"))
+          b = datetime.fromisoformat("${CLOSE}".replace("Z","+00:00"))
+          print(int((b - a).total_seconds()))
+          PY
+          )
+          cat <<EOF | tee mttr.json
+          {
+            "metric":       "dora.mttr",
+            "issue":        ${{ github.event.issue.number }},
+            "service":      "${{ github.event.repository.name }}",
+            "opened_at":    "${OPEN}",
+            "closed_at":    "${CLOSE}",
+            "mttr_seconds": ${MTTR_SECONDS},
+            "labels":       "${{ join(github.event.issue.labels.*.name, ',') }}",
+            "maintainer":   "${{ env.PLATFORM_OWNER }}"
+          }
+          EOF
+          echo "mttr_seconds=${MTTR_SECONDS}" >> "$GITHUB_OUTPUT"
+
+      - name: Push event
+        if: env.DORA_ENDPOINT != ''
+        run: |
+          curl -fsS -X POST "${DORA_ENDPOINT}/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "X-Platform-User: ${{ env.PLATFORM_OWNER }}" \
+            --data-binary @mttr.json
+
+      - name: Summary
+        run: |
+          {
+            echo "### DORA: MTTR"
+            echo ""
+            echo "- issue: #${{ github.event.issue.number }}"
+            echo "- mttr:  **${{ steps.mttr.outputs.mttr_seconds }}s**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: dora-mttr-${{ github.event.issue.number }}
+          path: mttr.json
+          retention-days: 365

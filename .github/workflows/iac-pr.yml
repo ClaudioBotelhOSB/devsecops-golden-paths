@@ -1,0 +1,464 @@
+# ==============================================================================
+# .github/workflows/iac-pr.yml
+# Zero-Trust Delivery Platform - Stage 0 (IaC + FinOps Shift-Left)
+# Owner: platform engineering
+#
+# Phases (all per-env, matrix-driven):
+#   1. static-analysis : tflint, tfsec, checkov, fmt
+#   2. plan            : terraform plan -out=tfplan.binary (canonicalised)
+#   3. sign-plan       : cosign sign-blob over the plan binary + JSON
+#   4. finops          : Infracost diff, hard-budget gate, soft-fail warn,
+#                        mandatory_tags enforcement, cost_center_allowlist
+#                        enforcement, approval label gate
+#   5. upload          : signed plan + signature + cert -> artifact consumed
+#                        by .github/workflows/iac-apply.yml
+#
+# The apply stage (iac-apply.yml) downloads THIS artifact, re-verifies the
+# signature against the same workflow identity, and only then applies the
+# exact binary plan. That is what closes the TOCTOU window.
+#
+# Permissions: workflow-level contents: read; jobs escalate per their needs.
+# ==============================================================================
+
+name: IaC - Plan, Sign, FinOps
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - '.platform/budgets.yaml'
+      - '.github/workflows/iac-pr.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iac-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ---- Central platform context (customize via repository Variables) ----
+  PLATFORM_OWNER:        ${{ vars.PLATFORM_OWNER     || github.repository_owner }}
+  PLATFORM_BOT_NAME:     ${{ vars.PLATFORM_BOT_NAME  || 'golden-path-bot' }}
+  PLATFORM_BOT_EMAIL:    ${{ vars.PLATFORM_BOT_EMAIL || 'golden-path-bot@example.invalid' }}
+  DEFAULT_REGION:        ${{ vars.DEFAULT_REGION     || 'us-east-1' }}
+  PLATFORM_COST_CENTER:  ${{ vars.PLATFORM_COST_CENTER || 'platform' }}
+  # ---- Workflow-specific ----
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  COSIGN_YES: "true"
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Discover changed environments
+  # ----------------------------------------------------------------------------
+  discover:
+    name: Discover changed environments
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      environments: ${{ steps.set.outputs.environments }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: set
+        name: Enumerate environments
+        run: |
+          set -euo pipefail
+          # Environments are matched from BOTH layouts:
+          #   terraform/environments/<env>/...     (per-env overlay dir)
+          #   terraform/environments/<env>.tfvars  (flat var file)
+          # plus any root terraform/** change defaults to the 'preview' env.
+          mapfile -t CHANGED < <(
+            git diff --name-only origin/${{ github.base_ref }}...HEAD \
+              | awk -F/ '
+                  /^terraform\/environments\/[^/]+\/.+/   { print $3 }
+                  /^terraform\/environments\/[^/]+\.tfvars$/ { sub(/\.tfvars$/,"",$3); print $3 }
+                ' | sort -u
+          )
+          if [ ${#CHANGED[@]} -eq 0 ]; then
+            CHANGED=(preview)
+          fi
+          JSON=$(printf '%s\n' "${CHANGED[@]}" | jq -R . | jq -sc .)
+          echo "environments=${JSON}" >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------------------
+  # Static analysis
+  # ----------------------------------------------------------------------------
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-24.04
+    needs: discover
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        # hashicorp/setup-terraform@v3.1.2
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Install tflint
+        # terraform-linters/setup-tflint@v4.1.1
+        uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6
+        with:
+          tflint_version: v0.53.0
+
+      - name: tflint init
+        run: tflint --chdir=terraform --init
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: tflint run
+        run: tflint --chdir=terraform --recursive --format=compact --config=$(pwd)/.tflint.hcl
+
+      - name: tfsec
+        # aquasecurity/tfsec-sarif-action@v0.1.4
+        uses: aquasecurity/tfsec-sarif-action@21ded20e8ca120cd9d3d6ab04ef746477542a608
+        with:
+          working_directory: terraform
+          sarif_file: tfsec.sarif
+
+      - name: Upload tfsec SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88
+        with:
+          sarif_file: tfsec.sarif
+          category: tfsec
+
+      - name: checkov
+        # bridgecrewio/checkov-action@v12.2.321
+        uses: bridgecrewio/checkov-action@ea75bba60b3ed4696b5d0cd8f3a1a88da7d3d2c5
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+          soft_fail: false
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          config_file: .checkov.yaml
+
+      - name: Upload checkov SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+      # Mandatory tags + cost-center allowlist enforcement is NOT done by
+      # regex over .tf source (which misses merge(), locals, default_tags,
+      # etc.). It runs against the concrete plan JSON inside plan-sign-finops
+      # below, where every resource's effective tag set is fully resolved.
+
+  # ----------------------------------------------------------------------------
+  # Plan -> Sign -> FinOps per environment
+  # ----------------------------------------------------------------------------
+  plan-sign-finops:
+    name: Plan / Sign / FinOps (${{ matrix.env }})
+    runs-on: ubuntu-24.04
+    needs: [discover, static-analysis]
+    permissions:
+      contents: read
+      id-token: write          # OIDC -> AWS + Cosign keyless
+      pull-requests: write     # Infracost PR comments
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.discover.outputs.environments) }}
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC)
+        # aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/gh-actions-tf-plan-${{ matrix.env }}
+          role-session-name: gh-iac-pr-${{ github.run_id }}
+          aws-region: ${{ env.DEFAULT_REGION }}
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config=backends/${{ matrix.env }}.hcl \
+            -lockfile=readonly
+
+      - name: Terraform validate
+        working-directory: terraform
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        id: plan
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          terraform plan \
+            -var-file=environments/${{ matrix.env }}.tfvars \
+            -out=tfplan.${{ matrix.env }}.binary \
+            -detailed-exitcode \
+            -no-color || EXIT=$?
+          EXIT=${EXIT:-0}
+          echo "exitcode=${EXIT}" >> "$GITHUB_OUTPUT"
+          terraform show -json tfplan.${{ matrix.env }}.binary > tfplan.${{ matrix.env }}.json
+          sha256sum tfplan.${{ matrix.env }}.binary | tee tfplan.${{ matrix.env }}.sha256
+
+      # ------------------------------------------------------------------
+      # Mandatory tags + cost_center allowlist enforcement - plan-JSON based
+      # Runs against the resolved plan, so it sees effective tags from
+      # merge(), default_tags, locals, variables, and module outputs.
+      # ------------------------------------------------------------------
+      - name: Enforce mandatory_tags and cost_center_allowlist (plan JSON)
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys, yaml, pathlib
+
+          plan_path = pathlib.Path("tfplan.${{ matrix.env }}.json")
+          plan      = json.loads(plan_path.read_text())
+
+          budgets = yaml.safe_load(open("../.platform/budgets.yaml"))
+          required = set(budgets.get("mandatory_tags", []))
+          allowed  = set(budgets.get("cost_center_allowlist", []))
+
+          # Walk planned resources. We look at the effective .values.tags
+          # that Terraform computes at plan time. Default tags from
+          # provider "aws" { default_tags {} } are merged by the AWS provider
+          # into every resource, so `tags_all` / `tags` will both reflect it.
+          errors = []
+          def walk(resources):
+              for r in resources:
+                  values = (r.get("values") or {})
+                  tags = values.get("tags_all") or values.get("tags") or {}
+                  if not isinstance(tags, dict):
+                      continue
+                  # skip data sources and resources that don't support tags
+                  if r.get("mode") != "managed":
+                      continue
+                  addr = r.get("address", "<unknown>")
+                  missing = required - set(tags.keys())
+                  if missing:
+                      errors.append(f"{addr}: missing required tags {sorted(missing)}")
+                  cc = tags.get("cost_center")
+                  if cc is not None and cc not in allowed:
+                      errors.append(f"{addr}: cost_center='{cc}' not in allowlist {sorted(allowed)}")
+
+          # planned_values.root_module contains both .resources and .child_modules[*].resources recursively
+          def collect(node):
+              out = list(node.get("resources", []))
+              for cm in node.get("child_modules", []) or []:
+                  out.extend(collect(cm))
+              return out
+
+          root = (plan.get("planned_values") or {}).get("root_module") or {}
+          resources = collect(root)
+
+          walk(resources)
+
+          if errors:
+              print("::error title=IaC tagging policy violation (plan JSON)::")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          print(f"plan tag policy OK: {len(resources)} managed resources checked")
+          PY
+
+      # ------------------------------------------------------------------
+      # Cosign sign-blob over the plan binary
+      # ------------------------------------------------------------------
+      - name: Install Cosign
+        # sigstore/cosign-installer@v3.7.0
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da
+        with:
+          cosign-release: v2.4.1
+
+      - name: Cosign sign-blob (plan binary)
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          cosign sign-blob \
+            --yes \
+            --output-signature tfplan.${{ matrix.env }}.binary.sig \
+            --output-certificate tfplan.${{ matrix.env }}.binary.pem \
+            tfplan.${{ matrix.env }}.binary
+
+      - name: Cosign verify-blob (sanity)
+        working-directory: terraform
+        run: |
+          cosign verify-blob \
+            --certificate tfplan.${{ matrix.env }}.binary.pem \
+            --signature  tfplan.${{ matrix.env }}.binary.sig \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/iac-pr\\.yml@.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            tfplan.${{ matrix.env }}.binary
+
+      # ------------------------------------------------------------------
+      # FinOps: full contract (delta, absolute, soft_fail, approval)
+      # ------------------------------------------------------------------
+      - name: Setup Infracost
+        # infracost/actions/setup@v3.0.1
+        uses: infracost/actions/setup@9e19f4034fef9d42fc03fb420373d8afbf9f96ae
+        with:
+          api-key: ${{ env.INFRACOST_API_KEY }}
+
+      - name: Infracost - main baseline
+        run: |
+          set -euo pipefail
+          git fetch origin main:main || true
+          git worktree add /tmp/main-tree main
+          infracost breakdown \
+            --path=/tmp/main-tree/terraform \
+            --terraform-var-file=environments/${{ matrix.env }}.tfvars \
+            --format=json \
+            --out-file=/tmp/main-baseline.${{ matrix.env }}.json || true
+
+      - name: Infracost - HEAD baseline
+        run: |
+          infracost breakdown \
+            --path=terraform \
+            --terraform-var-file=environments/${{ matrix.env }}.tfvars \
+            --format=json \
+            --out-file=/tmp/head-baseline.${{ matrix.env }}.json
+
+      - name: Infracost - diff
+        id: diff
+        run: |
+          infracost diff \
+            --path=/tmp/head-baseline.${{ matrix.env }}.json \
+            --compare-to=/tmp/main-baseline.${{ matrix.env }}.json \
+            --format=json \
+            --out-file=/tmp/diff.${{ matrix.env }}.json
+          DELTA=$(jq -r '.diffTotalMonthlyCost // "0"' /tmp/diff.${{ matrix.env }}.json)
+          TOTAL=$(jq -r '.totalMonthlyCost   // "0"' /tmp/head-baseline.${{ matrix.env }}.json)
+          echo "delta=${DELTA}" >> "$GITHUB_OUTPUT"
+          echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce FinOps policy (hard + soft + approval + tags)
+        id: policy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ENV="${{ matrix.env }}"
+          DELTA="${{ steps.diff.outputs.delta }}"
+          TOTAL="${{ steps.diff.outputs.total }}"
+
+          PR_DELTA=$(yq ".budgets.\"${ENV}\".pr_delta_usd"  .platform/budgets.yaml)
+          ABSOLUTE=$(yq ".budgets.\"${ENV}\".absolute_usd"  .platform/budgets.yaml)
+          SOFT=$(    yq ".budgets.\"${ENV}\".soft_fail_usd" .platform/budgets.yaml)
+          APPROVAL=$(yq ".budgets.\"${ENV}\".approval_usd"  .platform/budgets.yaml)
+
+          echo "policy: env=${ENV} delta=${DELTA} total=${TOTAL} " \
+               "pr_delta<=${PR_DELTA} absolute<=${ABSOLUTE} soft<=${SOFT} approval<=${APPROVAL}"
+
+          HARD_FAIL=0
+          SOFT_WARN=0
+          REASON=""
+
+          # --- hard gates ---
+          if awk -v a="${DELTA}" -v b="${PR_DELTA}" 'BEGIN{exit !(a>b)}'; then
+            HARD_FAIL=1
+            REASON="PR introduces +\$${DELTA}/mo > pr_delta ceiling \$${PR_DELTA}/mo (${ENV})"
+          fi
+          if awk -v a="${TOTAL}" -v b="${ABSOLUTE}" 'BEGIN{exit !(a>b)}'; then
+            HARD_FAIL=1
+            REASON="${REASON}; total \$${TOTAL}/mo > absolute ceiling \$${ABSOLUTE}/mo (${ENV})"
+          fi
+
+          # --- approval gate (label) ---
+          if awk -v a="${DELTA}" -v b="${APPROVAL}" 'BEGIN{exit !(a>b)}'; then
+            LABELS=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json labels --jq '.labels[].name' || echo "")
+            if ! grep -q '^finops-approved$' <<<"${LABELS}"; then
+              HARD_FAIL=1
+              REASON="${REASON}; delta \$${DELTA}/mo > approval \$${APPROVAL}/mo and label 'finops-approved' missing"
+            fi
+          fi
+
+          # --- soft gate (warn only) ---
+          if awk -v a="${DELTA}" -v b="${SOFT}" 'BEGIN{exit !(a>b)}'; then
+            SOFT_WARN=1
+            echo "::warning title=FinOps soft threshold (${ENV})::delta \$${DELTA}/mo > soft_fail \$${SOFT}/mo"
+            gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body \
+              "FinOps soft threshold exceeded for \`${ENV}\`: **+\$${DELTA}/mo** > soft_fail \$${SOFT}/mo. Below the hard ceiling, but attention recommended." \
+              || true
+          fi
+
+          if [ "${HARD_FAIL}" = "1" ]; then
+            echo "::error title=FinOps budget violation (${ENV})::${REASON}"
+            exit 1
+          fi
+
+      - name: Infracost PR comment
+        if: always()
+        run: |
+          infracost comment github \
+            --path=/tmp/diff.${{ matrix.env }}.json \
+            --repo=$GITHUB_REPOSITORY \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --github-token=${{ secrets.GITHUB_TOKEN }} \
+            --behavior=update \
+            --tag=${{ matrix.env }}
+
+      # ------------------------------------------------------------------
+      # Upload signed plan artifact -> consumed by iac-apply.yml
+      # ------------------------------------------------------------------
+      - name: Upload signed plan bundle
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: tfplan-${{ matrix.env }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            terraform/tfplan.${{ matrix.env }}.binary
+            terraform/tfplan.${{ matrix.env }}.json
+            terraform/tfplan.${{ matrix.env }}.sha256
+            terraform/tfplan.${{ matrix.env }}.binary.sig
+            terraform/tfplan.${{ matrix.env }}.binary.pem
+          retention-days: 14
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------------
+  # Required status gate
+  # ----------------------------------------------------------------------------
+  iac-gate:
+    name: IaC gate
+    runs-on: ubuntu-24.04
+    needs: [static-analysis, plan-sign-finops]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Evaluate
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.static-analysis.result }}"   != "success" ] || \
+             [ "${{ needs.plan-sign-finops.result }}"  != "success" ]; then
+            echo "::error::IaC gate failed - see upstream job logs"
+            exit 1
+          fi
+          echo "IaC gate green - signed plan artifacts ready for apply stage"

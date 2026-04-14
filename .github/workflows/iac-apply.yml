@@ -1,0 +1,261 @@
+# ==============================================================================
+# .github/workflows/iac-apply.yml
+# Zero-Trust Delivery Platform - Stage 0 (Signed Plan Apply)
+# Owner: platform engineering
+#
+# Closes the TOCTOU window: applies ONLY the exact binary plan that iac-pr.yml
+# produced and signed. No re-planning. No free-form apply. No human shortcut.
+#
+# Flow:
+#   1. A PR is merged to main. This workflow fires on push.
+#   2. It downloads the signed plan artifact produced by the merged PR run.
+#   3. cosign verify-blob against the expected workflow identity + cert.
+#   4. Check the sha256 of the binary matches the signed checksum.
+#   5. terraform init -lockfile=readonly + terraform apply tfplan.binary
+#   6. All artifacts are re-uploaded for audit.
+#
+# Permissions (least privilege):
+#   - workflow: contents: read
+#   - apply job: id-token (OIDC to AWS apply role), actions: read (to fetch
+#     the artifact from the upstream run), contents: read
+# ==============================================================================
+
+name: IaC - Apply signed plan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Upstream iac-pr.yml run ID containing the signed plan"
+        required: true
+      env:
+        description: "Target environment (preview|dev|staging|prod)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iac-apply-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # ---- Central platform context ----
+  PLATFORM_OWNER:  ${{ vars.PLATFORM_OWNER  || github.repository_owner }}
+  DEFAULT_REGION:  ${{ vars.DEFAULT_REGION  || 'us-east-1' }}
+  # ---- Workflow-specific ----
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Resolve which environments to apply
+  # ----------------------------------------------------------------------------
+  resolve:
+    name: Resolve target environments
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      envs:     ${{ steps.set.outputs.envs }}
+      run_id:   ${{ steps.set.outputs.run_id }}
+      head_sha: ${{ steps.set.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # The signed plan artifact was uploaded by iac-pr.yml as
+          #   tfplan-<env>-<pull_request.head.sha>
+          # To correlate on push/merge_group we resolve the PR that the
+          # merge commit belongs to, then use that PR's head.sha. This
+          # works uniformly for merge commits, squashes, and rebases
+          # because `/repos/{owner}/{repo}/commits/{sha}/pulls` returns
+          # every PR whose merge resulted in the supplied commit.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RUN_ID="${{ inputs.run_id }}"
+            ENVS="[\"${{ inputs.env }}\"]"
+            HEAD_SHA=$(gh api \
+              "repos/${{ github.repository }}/actions/runs/${RUN_ID}" \
+              --jq '.head_sha')
+          else
+            # Resolve PR that produced this commit
+            PR_NUMBER=$(gh api \
+              -H "Accept: application/vnd.github.groot-preview+json" \
+              "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+              --jq '.[0].number // empty')
+
+            if [ -z "${PR_NUMBER}" ]; then
+              echo "::warning::No PR correlated to commit ${{ github.sha }}; skipping apply"
+              echo "envs=[]"       >> "$GITHUB_OUTPUT"
+              echo "run_id="       >> "$GITHUB_OUTPUT"
+              echo "head_sha="     >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            HEAD_SHA=$(gh api \
+              "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+              --jq '.head.sha')
+
+            # Find the iac-pr.yml run for THAT head sha
+            RUN_ID=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --workflow "IaC - Plan, Sign, FinOps" \
+              --limit 100 \
+              --json databaseId,headSha,conclusion \
+              --jq ".[] | select(.headSha==\"${HEAD_SHA}\" and .conclusion==\"success\") | .databaseId" \
+              | head -n 1)
+
+            if [ -z "${RUN_ID}" ]; then
+              echo "::warning::No successful iac-pr.yml run found for head_sha=${HEAD_SHA}; skipping apply"
+              echo "envs=[]"       >> "$GITHUB_OUTPUT"
+              echo "run_id="       >> "$GITHUB_OUTPUT"
+              echo "head_sha="     >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Discover envs from the diff of the merge commit
+            mapfile -t CHANGED < <(
+              git diff --name-only HEAD~1...HEAD \
+                | awk -F/ '
+                    /^terraform\/environments\/[^/]+\/.+/      { print $3 }
+                    /^terraform\/environments\/[^/]+\.tfvars$/ { sub(/\.tfvars$/,"",$3); print $3 }
+                  ' | sort -u
+            )
+            [ ${#CHANGED[@]} -eq 0 ] && CHANGED=(preview)
+            ENVS=$(printf '%s\n' "${CHANGED[@]}" | jq -R . | jq -sc .)
+          fi
+
+          echo "run_id=${RUN_ID}"     >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "envs=${ENVS}"         >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------------------
+  # Apply (per environment)
+  # ----------------------------------------------------------------------------
+  apply:
+    name: Apply signed plan (${{ matrix.env }})
+    if: needs.resolve.outputs.envs != '[]'
+    runs-on: ubuntu-24.04
+    needs: [resolve]
+    environment: ${{ matrix.env }}          # forces environment protection rules
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        env: ${{ fromJSON(needs.resolve.outputs.envs) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da
+        with:
+          cosign-release: v2.4.1
+
+      - name: Download signed plan artifact from upstream run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ART_NAME="tfplan-${{ matrix.env }}-${{ needs.resolve.outputs.head_sha }}"
+          mkdir -p tf-plan
+          gh run download "${{ needs.resolve.outputs.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --name "${ART_NAME}" \
+            --dir tf-plan
+          ls -la tf-plan/
+
+      - name: Verify plan signature (cosign verify-blob)
+        run: |
+          set -euo pipefail
+          cd tf-plan
+          cosign verify-blob \
+            --certificate tfplan.${{ matrix.env }}.binary.pem \
+            --signature  tfplan.${{ matrix.env }}.binary.sig \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/iac-pr\\.yml@.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            tfplan.${{ matrix.env }}.binary
+
+      - name: Verify plan sha256 matches checksum file
+        run: |
+          set -euo pipefail
+          cd tf-plan
+          EXPECTED=$(awk '{print $1}' tfplan.${{ matrix.env }}.binary.sha256)
+          ACTUAL=$(sha256sum tfplan.${{ matrix.env }}.binary | awk '{print $1}')
+          if [ "${EXPECTED}" != "${ACTUAL}" ]; then
+            echo "::error title=Plan checksum drift::expected=${EXPECTED} actual=${ACTUAL}"
+            exit 1
+          fi
+          echo "plan integrity OK (${ACTUAL})"
+
+      - name: Configure AWS credentials (OIDC, apply role)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/gh-actions-tf-apply-${{ matrix.env }}
+          role-session-name: gh-iac-apply-${{ github.run_id }}
+          aws-region: ${{ env.DEFAULT_REGION }}
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config=backends/${{ matrix.env }}.hcl \
+            -lockfile=readonly
+
+      - name: Terraform apply (signed plan binary)
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          cp ../tf-plan/tfplan.${{ matrix.env }}.binary .
+          terraform apply -no-color -input=false -auto-approve tfplan.${{ matrix.env }}.binary
+
+      - name: Emit apply telemetry
+        if: always()
+        run: |
+          cat <<EOF | tee apply-event.json
+          {
+            "event":        "iac.apply",
+            "env":          "${{ matrix.env }}",
+            "run_id":       "${{ github.run_id }}",
+            "upstream_run": "${{ needs.resolve.outputs.run_id }}",
+            "commit":       "${{ github.sha }}",
+            "actor":        "${{ github.actor }}",
+            "result":       "${{ job.status }}",
+            "ts":           "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "maintainer":   "${{ env.PLATFORM_OWNER }}"
+          }
+          EOF
+
+      - name: Upload apply audit bundle
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: apply-audit-${{ matrix.env }}-${{ github.run_id }}
+          path: |
+            tf-plan/
+            apply-event.json
+          retention-days: 365
