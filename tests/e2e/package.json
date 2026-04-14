@@ -1,0 +1,14 @@
+{
+  "name": "golden-path-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright E2E suite that runs against preview environments. Maintained by the platform team.",
+  "scripts": {
+    "test":    "playwright test",
+    "report":  "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.2",
+    "@types/node":      "20.17.6"
+  }
+}

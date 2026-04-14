@@ -1,0 +1,22 @@
+name: golden_path_patrol_suite
+description: Patrol integration_test suite for any Flutter app that runs against a preview environment provisioned by the Zero-Trust Golden Path.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  patrol: ^3.11.1
+
+flutter:
+  uses-material-design: true
