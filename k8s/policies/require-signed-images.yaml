@@ -1,0 +1,271 @@
+# ==============================================================================
+# k8s/policies/require-signed-images.yaml
+# Zero-Trust Delivery Platform - Supply Chain Admission Firewall
+#
+# Hardened version:
+#   - Covers containers, initContainers, AND ephemeralContainers (kubectl debug)
+#   - Requires digest-pinned images in EVERY container type
+#   - Blocks images from untrusted registries (deny by default)
+#   - Enforces Cosign keyless signature bound to the expected workflow path
+#   - Enforces BOTH SPDX SBOM + SLSA v1 provenance attestations
+#   - Validates attestation content (non-empty predicate, expected buildType)
+#
+# BEFORE APPLYING: substitute the following placeholders (envsubst or
+# GitOps overlay). Every token is intentionally NOT a Kyverno variable,
+# because the trust allowlist must be a concrete string for the
+# admission controller to reason about.
+#
+#   <OCI_REGISTRY>      -> your OCI registry host (ghcr.io, quay.io, ...)
+#   <OCI_NAMESPACE>     -> path prefix within the registry, usually <OWNER>
+#   <ALT_OCI_REGISTRY>  -> optional second registry to allowlist; delete
+#                          the corresponding imageReferences entry if you
+#                          only run one registry
+#   <OWNER>/<REPO>      -> the repo that owns backend-ci.yml
+#
+# Bootstrap namespaces (kube-system, kyverno, sigstore-system, cert-manager,
+# argocd) are excluded to avoid chicken-and-egg issues. Every other namespace
+# is in scope, including all prod-*, staging-*, dev-*, and pr-* (previews).
+# ==============================================================================
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+  annotations:
+    policies.kyverno.io/title:       Require Signed Images + Attestations
+    policies.kyverno.io/category:    Supply Chain Security
+    policies.kyverno.io/severity:    high
+    policies.kyverno.io/subject:     Pod
+    policies.kyverno.io/description: >-
+      Blocks any Pod whose container, initContainer, or ephemeralContainer
+      is not Cosign-signed by the expected GitHub Actions workflow identity
+      and accompanied by valid SPDX SBOM AND SLSA v1 provenance attestations.
+      Also enforces digest-pinning and trusted-registry allowlist.
+      Maintained by the platform team.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+
+    # --------------------------------------------------------------------------
+    # 1) verifyImages - signature + BOTH attestations on every container type.
+    # --------------------------------------------------------------------------
+    - name: verify-signatures-and-attestations
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - kyverno
+                - sigstore-system
+                - cert-manager
+                - argocd
+      verifyImages:
+        - imageReferences:
+            - "<OCI_REGISTRY>/<OCI_NAMESPACE>/*"
+            - "<ALT_OCI_REGISTRY>/<OCI_NAMESPACE>/*"
+          required: true
+          mutateDigest: true
+          verifyDigest: true
+          useCache: true
+          imageRegistryCredentials:
+            allowInsecureRegistry: false
+          # Cover every image location in the pod spec
+          validationFailureAction: Enforce
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/<OWNER>/<REPO>/.github/workflows/backend-ci.yml@refs/heads/main"
+                    issuer:  "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+                    ctlog:
+                      url: https://ctfe.sigstore.dev/2022
+          attestations:
+            # --- SPDX SBOM ---
+            - type: https://spdx.dev/Document
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        subject: "https://github.com/<OWNER>/<REPO>/.github/workflows/backend-ci.yml@refs/heads/main"
+                        issuer:  "https://token.actions.githubusercontent.com"
+                        rekor:
+                          url: https://rekor.sigstore.dev
+              conditions:
+                - all:
+                    - key: "{{ spdxVersion || '' }}"
+                      operator: NotEquals
+                      value: ""
+                    - key: "{{ creationInfo.created || '' }}"
+                      operator: NotEquals
+                      value: ""
+                    - key: "{{ length(packages) || `0` }}"
+                      operator: GreaterThan
+                      value: 0
+            # --- SLSA v1 provenance ---
+            - type: https://slsa.dev/provenance/v1
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        subject: "https://github.com/<OWNER>/<REPO>/.github/workflows/backend-ci.yml@refs/heads/main"
+                        issuer:  "https://token.actions.githubusercontent.com"
+                        rekor:
+                          url: https://rekor.sigstore.dev
+              conditions:
+                - all:
+                    - key: "{{ buildType || '' }}"
+                      operator: Equals
+                      value: "https://github.com/actions/runner/buildTypes/v1"
+                    - key: "{{ invocation.configSource.entryPoint || '' }}"
+                      operator: Equals
+                      value: ".github/workflows/backend-ci.yml"
+                    - key: "{{ materials[0].uri || '' }}"
+                      operator: NotEquals
+                      value: ""
+
+    # --------------------------------------------------------------------------
+    # 2) deny any image that is NOT on the trusted registry allowlist,
+    #    across containers, initContainers, AND ephemeralContainers.
+    # --------------------------------------------------------------------------
+    - name: deny-untrusted-registries
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - sigstore-system
+                - cert-manager
+                - argocd
+      validate:
+        message: >-
+          Image registry not on the trusted allowlist. Only
+          <OCI_REGISTRY>/<OCI_NAMESPACE>/* and <ALT_OCI_REGISTRY>/<OCI_NAMESPACE>/*
+          are permitted for containers, initContainers, and ephemeralContainers.
+          Contact the platform team if you need to add a registry.
+        foreach:
+          - list: "request.object.spec.containers || []"
+            pattern:
+              image: "<OCI_REGISTRY>/<OCI_NAMESPACE>/* | <ALT_OCI_REGISTRY>/<OCI_NAMESPACE>/*"
+          - list: "request.object.spec.initContainers || []"
+            pattern:
+              image: "<OCI_REGISTRY>/<OCI_NAMESPACE>/* | <ALT_OCI_REGISTRY>/<OCI_NAMESPACE>/*"
+          - list: "request.object.spec.ephemeralContainers || []"
+            pattern:
+              image: "<OCI_REGISTRY>/<OCI_NAMESPACE>/* | <ALT_OCI_REGISTRY>/<OCI_NAMESPACE>/*"
+
+    # --------------------------------------------------------------------------
+    # 3) Require digest-pinned images across ALL container types for prod+stg.
+    # --------------------------------------------------------------------------
+    - name: require-image-digest
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces:
+                - "prod-*"
+                - "production"
+                - "staging-*"
+                - "staging"
+      validate:
+        message: >-
+          Production and staging pods MUST reference images by digest
+          (sha256:...). Mutable tags such as :latest, :vX, or :stable
+          are forbidden across containers, initContainers, and
+          ephemeralContainers.
+        foreach:
+          - list: "request.object.spec.containers || []"
+            pattern:
+              image: "*@sha256:*"
+          - list: "request.object.spec.initContainers || []"
+            pattern:
+              image: "*@sha256:*"
+          - list: "request.object.spec.ephemeralContainers || []"
+            pattern:
+              image: "*@sha256:*"
+
+    # --------------------------------------------------------------------------
+    # 4) Require runtime hardening baseline (non-negotiable) - covers
+    #    containers, initContainers, AND ephemeralContainers.
+    # --------------------------------------------------------------------------
+    - name: require-runtime-hardening
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - sigstore-system
+                - cert-manager
+                - argocd
+      validate:
+        message: >-
+          Pods must set runAsNonRoot=true, readOnlyRootFilesystem=true,
+          allowPrivilegeEscalation=false, and drop ALL capabilities across
+          containers, initContainers, and ephemeralContainers.
+        foreach:
+          - list: "request.object.spec.containers || []"
+            pattern:
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+          - list: "request.object.spec.initContainers || []"
+            pattern:
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+          - list: "request.object.spec.ephemeralContainers || []"
+            pattern:
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+
+    # --------------------------------------------------------------------------
+    # 5) Pod-level securityContext must require non-root.
+    # --------------------------------------------------------------------------
+    - name: require-pod-nonroot
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - sigstore-system
+                - cert-manager
+                - argocd
+      validate:
+        message: "Pods must set spec.securityContext.runAsNonRoot=true."
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true

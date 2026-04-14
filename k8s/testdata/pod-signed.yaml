@@ -1,0 +1,42 @@
+# ==============================================================================
+# k8s/testdata/pod-signed.yaml
+# Sample Pod used by `make policy-test` to verify the Kyverno signed-images
+# policy against a well-formed input. Should be PASSED by the policy.
+# Owner: platform engineering
+# ==============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-signed
+  namespace: prod-example
+  labels:
+    app.kubernetes.io/name: <APP_NAME>
+    platform.io/owner:      platform-team
+spec:
+  serviceAccountName: default
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    - name: bootstrap
+      image: ghcr.io/<OWNER>/<REPO>/api@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      command: ["/bin/true"]
+  containers:
+    - name: api
+      image: ghcr.io/<OWNER>/<REPO>/api@sha256:2222222222222222222222222222222222222222222222222222222222222222
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      ports:
+        - { name: http, containerPort: 8080 }

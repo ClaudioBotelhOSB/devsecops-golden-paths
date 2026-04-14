@@ -1,0 +1,115 @@
+# ==============================================================================
+# k8s/controllers/ttl-reaper-deployment.yaml
+# Preview-environment TTL reaper controller - deployment manifest.
+#
+# Placeholders you MUST substitute before applying:
+#   <YOUR_PLATFORM_NAMESPACE>   e.g. platform-system
+#   <YOUR_PLATFORM_MANAGER>     free-form string, applied as managed-by label
+#   <YOUR_OWNER>                free-form owner string
+#   <YOUR_OCI_REGISTRY>         e.g. ghcr.io
+#   <YOUR_ORG>                  GitHub/registry org
+#   <YOUR_REPO>                 GitHub repo name
+#   <YOUR_DIGEST>               signed image digest (sha256:...)
+# ==============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: <YOUR_PLATFORM_NAMESPACE>
+  labels:
+    app.kubernetes.io/managed-by: <YOUR_PLATFORM_MANAGER>
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ttl-reaper
+  namespace: <YOUR_PLATFORM_NAMESPACE>
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ttl-reaper
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ttl-reaper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ttl-reaper
+subjects:
+  - kind: ServiceAccount
+    name: ttl-reaper
+    namespace: <YOUR_PLATFORM_NAMESPACE>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ttl-reaper
+  namespace: <YOUR_PLATFORM_NAMESPACE>
+  labels:
+    app.kubernetes.io/name:    ttl-reaper
+    app.kubernetes.io/part-of: <YOUR_PLATFORM_NAMESPACE>
+    platform.io/owner:         "<YOUR_OWNER>"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ttl-reaper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ttl-reaper
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "9090"
+        prometheus.io/path:   "/metrics"
+    spec:
+      serviceAccountName: ttl-reaper
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ttl-reaper
+          image: <YOUR_OCI_REGISTRY>/<YOUR_ORG>/<YOUR_REPO>/ttl-reaper@sha256:<YOUR_DIGEST>
+          imagePullPolicy: IfNotPresent
+          args:
+            - --interval=15m
+            - --metrics-addr=:9090
+            - --log-level=info
+          ports:
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            httpGet: { path: /readyz,  port: metrics }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

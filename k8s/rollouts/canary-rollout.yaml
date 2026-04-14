@@ -1,0 +1,405 @@
+# ==============================================================================
+# k8s/rollouts/canary-rollout.yaml
+# Zero-Trust Delivery Platform - Progressive Delivery (Argo Rollouts)
+# Owner: platform engineering
+#
+# BEFORE APPLYING: this template uses placeholders that MUST be substituted
+# before `kubectl apply`. Replace the following tokens to match your service
+# (a simple `envsubst` run or a GitOps overlay is enough):
+#
+#   <APP_NAME>        -> logical service name (matches Helm release name)
+#   <APP_NAMESPACE>   -> target Kubernetes namespace
+#   <APP_OWNER>       -> free-form owner string (team handle, email, etc.)
+#   <OCI_REGISTRY>    -> OCI registry host (ghcr.io, quay.io, etc.)
+#   <OWNER>/<REPO>    -> owner/repo pair for the signed image
+#   <DIGEST>          -> sha256 digest of the signed image
+#   <HTTP_PORT>       -> numeric HTTP port your container exposes
+#   <METRICS_PORT>    -> numeric metrics port (or delete that port/annotations)
+#   <HEALTH_PATH>     -> liveness probe path (e.g. /healthz, /health, /live)
+#   <READINESS_PATH>  -> readiness probe path (e.g. /readyz, /ready)
+#
+# The manifest below is a Go-HTTP service example. If you run a different
+# stack, replace the probe paths and ports accordingly. Every other field
+# - Argo analysis templates, Istio routing, NetworkPolicy - is
+# stack-neutral.
+#
+# Canary / stable isolation strategy:
+#
+#   Argo Rollouts exposes TWO distinct Services (stable + canary) pointed at
+#   the same ReplicaSet family. Istio's VirtualService splits traffic between
+#   them. Istio's built-in metrics (`istio_requests_total`,
+#   `istio_request_duration_milliseconds_bucket`) carry the
+#   `destination_service_name` label, which differs between the stable and
+#   canary Services. That is what lets every AnalysisTemplate below isolate
+#   canary-only metrics WITHOUT depending on any application-side label
+#   injection.
+#
+#   In addition, the Rollout spec injects `track: canary` and `track: stable`
+#   pod labels via canaryMetadata/stableMetadata, so any downstream consumer
+#   that scrapes `kube_pod_labels` can also slice by track if it prefers.
+#
+# Hardening over the previous version:
+#   - latency-p99 is BASELINE-RELATIVE: canary_p99 / stable_p99 <= 1.20
+#   - success-rate, error-budget are computed against the CANARY destination
+#     service only, not the aggregated workload
+#   - AIOps call is HTTPS with a Bearer token from a Secret (argsValueFrom)
+# ==============================================================================
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: <APP_NAME>
+  namespace: <APP_NAMESPACE>
+  labels:
+    app.kubernetes.io/name:       <APP_NAME>
+    app.kubernetes.io/part-of:    <APP_NAME>
+    app.kubernetes.io/managed-by: argo-rollouts
+    platform.io/owner:            "<APP_OWNER>"
+    platform.io/cost-center:      platform
+    platform.io/tier:             tier-0
+spec:
+  replicas: 10
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 1800
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: <APP_NAME>
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: <APP_NAME>
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "<METRICS_PORT>"
+        prometheus.io/path:   "/metrics"
+    spec:
+      serviceAccountName: <APP_NAME>
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # Rename, repurpose, add sidecars freely. The rest of the manifest
+        # only cares about the service name, not the container name.
+        - name: <APP_NAME>
+          image: <OCI_REGISTRY>/<OWNER>/<REPO>/<APP_NAME>@sha256:<DIGEST>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: <HTTP_PORT>
+            - name: metrics
+              containerPort: <METRICS_PORT>
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: <APP_NAME>
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.owner=<APP_OWNER>"
+          # readiness/liveness paths are examples; replace them with
+          # whatever your stack exposes.
+          readinessProbe:
+            httpGet: { path: <READINESS_PATH>, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: <HEALTH_PATH>, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+  strategy:
+    canary:
+      canaryService: <APP_NAME>-canary
+      stableService: <APP_NAME>-stable
+      # Argo Rollouts stamps these labels/annotations onto canary vs stable
+      # pods so Prometheus (and any sidecar inspection) can split them.
+      canaryMetadata:
+        labels:
+          track: canary
+        annotations:
+          platform.io/track: canary
+      stableMetadata:
+        labels:
+          track: stable
+        annotations:
+          platform.io/track: stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: <APP_NAME>
+            routes: [primary]
+      steps:
+        - setWeight: 5
+        - pause: { duration: 2m }
+        - analysis:
+            templates:
+              - templateName: success-rate
+              - templateName: latency-p99-relative
+              - templateName: error-budget
+              - templateName: aiops-anomaly
+            args:
+              - name: namespace
+                value: <APP_NAMESPACE>
+              - name: canary-service
+                value: <APP_NAME>-canary
+              - name: stable-service
+                value: <APP_NAME>-stable
+
+        - setWeight: 25
+        - pause: { duration: 5m }
+        - analysis:
+            templates:
+              - templateName: success-rate
+              - templateName: latency-p99-relative
+              - templateName: error-budget
+              - templateName: aiops-anomaly
+            args:
+              - name: namespace
+                value: <APP_NAMESPACE>
+              - name: canary-service
+                value: <APP_NAME>-canary
+              - name: stable-service
+                value: <APP_NAME>-stable
+
+        - setWeight: 50
+        - pause: { duration: 10m }
+        - analysis:
+            templates:
+              - templateName: success-rate
+              - templateName: latency-p99-relative
+              - templateName: error-budget
+              - templateName: aiops-anomaly
+            args:
+              - name: namespace
+                value: <APP_NAMESPACE>
+              - name: canary-service
+                value: <APP_NAME>-canary
+              - name: stable-service
+                value: <APP_NAME>-stable
+
+        - setWeight: 100
+
+# ==============================================================================
+# AnalysisTemplates
+# ==============================================================================
+
+---
+# ------------------------------------------------------------------------------
+# Success rate - measured strictly on the CANARY destination service.
+# ------------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: <APP_NAMESPACE>
+spec:
+  args:
+    - name: namespace
+    - name: canary-service
+    - name: stable-service
+  metrics:
+    - name: canary-success-rate
+      interval: 30s
+      count: 4
+      successCondition: result[0] >= 0.995
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(istio_requests_total{
+              destination_service_name="{{args.canary-service}}",
+              destination_service_namespace="{{args.namespace}}",
+              reporter="destination",
+              response_code!~"5.."
+            }[2m]))
+            /
+            clamp_min(
+              sum(rate(istio_requests_total{
+                destination_service_name="{{args.canary-service}}",
+                destination_service_namespace="{{args.namespace}}",
+                reporter="destination"
+              }[2m])),
+              0.001
+            )
+
+---
+# ------------------------------------------------------------------------------
+# BASELINE-RELATIVE p99 latency using istio metrics and destination_service_name
+# to keep canary vs stable isolation entirely outside the workload's control.
+# ------------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: latency-p99-relative
+  namespace: <APP_NAMESPACE>
+spec:
+  args:
+    - name: namespace
+    - name: canary-service
+    - name: stable-service
+  metrics:
+    - name: latency-p99-ratio
+      interval: 30s
+      count: 4
+      successCondition: result[0] <= 1.20
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            (
+              histogram_quantile(0.99,
+                sum by (le) (
+                  rate(istio_request_duration_milliseconds_bucket{
+                    destination_service_name="{{args.canary-service}}",
+                    destination_service_namespace="{{args.namespace}}",
+                    reporter="destination"
+                  }[2m])
+                )
+              )
+              /
+              clamp_min(
+                histogram_quantile(0.99,
+                  sum by (le) (
+                    rate(istio_request_duration_milliseconds_bucket{
+                      destination_service_name="{{args.stable-service}}",
+                      destination_service_namespace="{{args.namespace}}",
+                      reporter="destination"
+                    }[2m])
+                  )
+                ),
+                0.001
+              )
+            )
+
+---
+# ------------------------------------------------------------------------------
+# Error budget (canary only).
+# ------------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-budget
+  namespace: <APP_NAMESPACE>
+spec:
+  args:
+    - name: namespace
+    - name: canary-service
+    - name: stable-service
+  metrics:
+    - name: canary-error-budget
+      interval: 1m
+      count: 3
+      successCondition: result[0] >= 0
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            1 - (
+              sum(rate(istio_requests_total{
+                destination_service_name="{{args.canary-service}}",
+                destination_service_namespace="{{args.namespace}}",
+                reporter="destination",
+                response_code=~"5.."
+              }[5m]))
+              /
+              clamp_min(
+                sum(rate(istio_requests_total{
+                  destination_service_name="{{args.canary-service}}",
+                  destination_service_namespace="{{args.namespace}}",
+                  reporter="destination"
+                }[5m])),
+                0.001
+              )
+            ) - 0.995
+
+---
+# ------------------------------------------------------------------------------
+# AIOps anomaly detection - HTTPS + Bearer token from Kubernetes Secret.
+# ------------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: aiops-anomaly
+  namespace: <APP_NAMESPACE>
+spec:
+  args:
+    - name: namespace
+    - name: canary-service
+    - name: stable-service
+    - name: aiopsToken
+      valueFrom:
+        secretKeyRef:
+          name: aiops-analysis-token
+          key:  token
+  metrics:
+    - name: aiops-anomaly-score
+      interval: 1m
+      count: 3
+      successCondition: result.score < 0.70
+      failureLimit: 1
+      provider:
+        web:
+          url: https://aiops.platform.svc.cluster.local:8443/v1/anomaly
+          method: POST
+          timeoutSeconds: 15
+          insecure: false
+          headers:
+            - key: Content-Type
+              value: application/json
+            - key: Authorization
+              value: "Bearer {{args.aiopsToken}}"
+            - key: X-Platform-User
+              value: "<APP_OWNER>"
+          body: |
+            {
+              "namespace":       "{{args.namespace}}",
+              "canary_service":  "{{args.canary-service}}",
+              "stable_service":  "{{args.stable-service}}",
+              "window":          "5m",
+              "signals":         ["logs", "traces", "metrics", "oom_events"]
+            }
+          jsonPath: "{$}"
+
+# ==============================================================================
+# Stable + Canary Services
+# ==============================================================================
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <APP_NAME>-stable
+  namespace: <APP_NAMESPACE>
+  labels:
+    track: stable
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: <APP_NAME>
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <APP_NAME>-canary
+  namespace: <APP_NAMESPACE>
+  labels:
+    track: canary
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: <APP_NAME>
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

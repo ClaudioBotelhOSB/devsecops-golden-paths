@@ -1,0 +1,60 @@
+# ==============================================================================
+# k8s/preview/networkpolicy.yaml
+#
+# Preview-namespace NetworkPolicy overlay. Rendered at apply time by
+# `envsubst` in .github/workflows/preview-env.yml with:
+#
+#   PREVIEW_INGRESS_NAMESPACE     (default: ingress-nginx)
+#   PREVIEW_DNS_NAMESPACE         (default: kube-system)
+#   PREVIEW_METADATA_CIDR_EXCLUDE (default: 169.254.169.254/32)
+#
+# Override any of them as GitHub Actions Variables, or delete this file
+# entirely if your cluster enforces NetworkPolicy at a higher layer.
+# ==============================================================================
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${PREVIEW_INGRESS_NAMESPACE}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-and-egress
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${PREVIEW_DNS_NAMESPACE}
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    - to:
+        - ipBlock:
+            cidr: "0.0.0.0/0"
+            except:
+              - "${PREVIEW_METADATA_CIDR_EXCLUDE}"
+      ports:
+        - { port: 443, protocol: TCP }
