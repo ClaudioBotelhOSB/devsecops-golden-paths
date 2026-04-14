@@ -1,0 +1,54 @@
+# ==============================================================================
+# charts/backend-template/values.preview.yaml
+# Preview overlay. Consumed by .github/workflows/preview-env.yml.
+#
+# CI injects on the CLI:
+#   --set image.repository=<OCI>/<owner>/<repo>/<app>
+#   --set image.digest=sha256:...
+#   --set ingress.host=<pr-N host derived from PREVIEW_BASE_DOMAIN>
+#   --set global.owner=<PLATFORM_OWNER>
+#   --set preview.pr=<N>
+# ==============================================================================
+
+replicaCount: 1
+
+image:
+  pullPolicy: IfNotPresent
+
+podAnnotations:
+  platform.io/preview: "true"
+
+podLabels:
+  platform.io/preview: "true"
+
+# Wire sane defaults for preview *structure*, without assuming language.
+# Override `readinessProbe` / `livenessProbe` per service if needed.
+readinessProbe:
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+
+livenessProbe:
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 10
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+ingress:
+  enabled: true
+  className: ""     # set via `--set ingress.className=<your-class>`
+  annotations: {}   # set via `--set-string` or a secondary overlay
+  tls:
+    enabled: true
+
+preview:
+  enabled: true

@@ -1,0 +1,100 @@
+# ==============================================================================
+# charts/backend-template/values.yaml
+#
+# A small, stack-agnostic chart. It ships with a few pragmatic defaults
+# (replicaCount=2, image.tag=latest, a single HTTP port, service enabled)
+# so that `helm template` renders something valid out of the box. Those
+# defaults are a CONVENIENCE, not an opinion - every one of them is
+# individually overridable via values.*.yaml overlays or `--set` flags.
+#
+# The chart makes NO assumption about language, framework, container
+# command/args, probe paths, port numbers (beyond the default 8080),
+# or labels beyond the Kubernetes standard set. Override any field
+# you dislike.
+# ==============================================================================
+
+nameOverride:     ""
+fullnameOverride: ""
+
+# Global platform context. Set once at install time (e.g. from a workflow
+# `global.owner=${{ vars.PLATFORM_OWNER }}`) and reused across labels.
+global:
+  owner: ""                 # free-form string, applied as platform.io/owner if set
+  extraLabels: {}           # merged into app.labels; arbitrary schema
+
+replicaCount: 2
+
+image:
+  # `repository` MUST be set at install time. Preferred: CI sets it from
+  # `${{ vars.OCI_REGISTRY }}/${{ github.repository_owner }}/${{ github.event.repository.name }}/<app>`.
+  repository: ""
+  tag:        "latest"
+  digest:     ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name:    ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels:      {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem:   true
+  capabilities:
+    drop: ["ALL"]
+
+# Everything about the container is free-form. The chart makes NO assumption
+# about language, framework, ports, flags, or probe paths.
+container:
+  name: app
+  command: []
+  args:    []
+  ports:
+    - name: http
+      containerPort: 8080
+      protocol: TCP
+
+service:
+  enabled: true
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls:
+    enabled: false
+    secretName: ""
+
+resources: {}
+
+env: {}
+
+# Null by default - set a httpGet/tcpSocket/exec probe in your overlay.
+readinessProbe: null
+livenessProbe:  null
+
+networkPolicy:
+  enabled: false
+
+preview:
+  enabled: false
+  pr:      ""
+  ttl:     ""
+  owner:   ""

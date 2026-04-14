@@ -1,0 +1,18 @@
+{{ .Chart.Name }} chart installed.
+
+  release:    {{ .Release.Name }}
+  namespace:  {{ .Release.Namespace }}
+  service:    {{ include "app.name" . }}
+  image:      {{ include "app.image" . }}
+
+{{- if .Values.preview.enabled }}
+
+Preview environment metadata:
+  pr:    {{ .Values.preview.pr }}
+  ttl:   {{ .Values.preview.ttl }}
+  owner: {{ .Values.preview.owner }}
+
+{{- if .Values.ingress.host }}
+Host:   https://{{ .Values.ingress.host }}
+{{- end }}
+{{- end }}
