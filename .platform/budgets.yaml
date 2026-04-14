@@ -1,0 +1,51 @@
+# ==============================================================================
+# .platform/budgets.yaml
+# FinOps budget policy - consumed by .github/workflows/iac-pr.yml
+# Owner: platform engineering
+#
+# Units: USD / month
+# pr_delta_usd    -> hard ceiling for an INCREMENTAL cost change on a PR
+# absolute_usd    -> hard ceiling for the TOTAL monthly cost of the environment
+# soft_fail_usd   -> warning threshold; posts comment but does not block
+# approval_usd    -> above this, requires FinOps label on the PR
+# ==============================================================================
+
+budgets:
+  preview:
+    pr_delta_usd:   50
+    absolute_usd:   200
+    soft_fail_usd:  30
+    approval_usd:   75
+
+  dev:
+    pr_delta_usd:   150
+    absolute_usd:   1500
+    soft_fail_usd:  100
+    approval_usd:   250
+
+  staging:
+    pr_delta_usd:   300
+    absolute_usd:   4500
+    soft_fail_usd:  200
+    approval_usd:   500
+
+  prod:
+    pr_delta_usd:   750
+    absolute_usd:   25000
+    soft_fail_usd:  500
+    approval_usd:   1000
+
+mandatory_tags:
+  - cost_center
+  - owner_email
+  - environment
+  - service
+  - managed_by
+
+cost_center_allowlist:
+  - platform
+  - product
+  - data
+  - ml
+  - security
+  - infra

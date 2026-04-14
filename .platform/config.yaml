@@ -1,0 +1,177 @@
+# ==============================================================================
+# .platform/config.yaml
+# SINGLE SOURCE OF TRUTH for every customizable knob in this template.
+#
+# This file is informational — the workflows, charts, and Makefile read
+# their defaults from GitHub Actions `vars` / environment variables, not
+# from this YAML. The purpose of this file is to give you ONE PLACE to
+# review every value you need to decide on before the pipeline runs
+# cleanly in your own organization.
+#
+# How to adopt:
+#   1. Read each block below.
+#   2. For every value that needs to change, set it as a GitHub Actions
+#      **Variable** (Settings -> Variables -> Actions -> New variable)
+#      using the EXACT NAME column. The workflows pick it up automatically.
+#   3. For secrets (tokens, API keys), set them as Actions Secrets instead.
+#   4. Delete the `todo:` list at the end of this file as you complete each
+#      item so you always have a running checklist for new repos.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Ownership + identity
+# ------------------------------------------------------------------------------
+ownership:
+  PLATFORM_OWNER:
+    description: >
+      Free-form owner string (GitHub login, team handle, email, etc.).
+      Appears in labels, logs, DORA payloads, SLSA provenance, and drift
+      incidents. Defaults to github.repository_owner if unset.
+    default: "${{ github.repository_owner }}"
+  PLATFORM_BOT_NAME:
+    description: Git author used by automated PRs (GitOps bump, quarantine).
+    default: "golden-path-bot"
+  PLATFORM_BOT_EMAIL:
+    description: Git author email for automated PRs.
+    default: "golden-path-bot@example.invalid"
+  PLATFORM_EMAIL_DOMAIN:
+    description: Domain used for namespace ownership annotations.
+    default: "example.internal"
+
+# ------------------------------------------------------------------------------
+# 2. Cloud + region + FinOps
+# ------------------------------------------------------------------------------
+cloud:
+  DEFAULT_REGION:
+    description: Default cloud region for Terraform, AWS OIDC, and EKS.
+    default: "us-east-1"
+  PLATFORM_COST_CENTER:
+    description: FinOps attribution tag; must be on the allowlist in .platform/budgets.yaml.
+    default: "platform"
+
+# ------------------------------------------------------------------------------
+# 3. OCI registry + supply chain
+# ------------------------------------------------------------------------------
+supply_chain:
+  OCI_REGISTRY:
+    description: OCI registry host. GHCR is the default because the workflows use GitHub OIDC.
+    default: "ghcr.io"
+  OCI_VENDOR:
+    description: OCI label org.opencontainers.image.vendor.
+    default: "${{ github.repository_owner }}"
+  OCI_AUTHORS:
+    description: OCI label org.opencontainers.image.authors.
+    default: "golden-path-bot@example.invalid"
+
+# ------------------------------------------------------------------------------
+# 4. Preview environment
+# ------------------------------------------------------------------------------
+preview:
+  PREVIEW_CLUSTER_NAME:
+    description: EKS (or any K8s) cluster name used for preview deployments.
+    default: "preview-cluster"
+  PREVIEW_BASE_DOMAIN:
+    description: Base domain for preview ingresses (full host = pr-<N>.<base>).
+    default: "preview.example.internal"
+  PREVIEW_INGRESS_CLASS:
+    description: Helm `ingress.className` passed at install time.
+    default: "nginx"
+  PREVIEW_NETPOL_FILE:
+    description: envsubst-rendered NetworkPolicy overlay path inside the repo.
+    default: "k8s/preview/networkpolicy.yaml"
+  PREVIEW_INGRESS_NAMESPACE:
+    description: Namespace label used by allow-ingress-controller rule.
+    default: "ingress-nginx"
+  PREVIEW_DNS_NAMESPACE:
+    description: Namespace label used by allow-dns rule.
+    default: "kube-system"
+  PREVIEW_METADATA_CIDR_EXCLUDE:
+    description: Cloud metadata CIDR excluded from egress allow.
+    default: "169.254.169.254/32"
+
+# ------------------------------------------------------------------------------
+# 5. GitOps handoff
+# ------------------------------------------------------------------------------
+gitops:
+  GITOPS_REPO:
+    description: Manifest repository the backend-ci gitops-bump job opens PRs against.
+    default: "${{ github.repository_owner }}/platform-gitops"
+  GITOPS_PATH:
+    description: File path inside GITOPS_REPO that holds the staging values.yaml.
+    default: "apps/${{ github.event.repository.name }}/staging/values.yaml"
+
+# ------------------------------------------------------------------------------
+# 6. Secrets the pipelines require (set as Actions Secrets, not Variables)
+# ------------------------------------------------------------------------------
+secrets_required:
+  - name: AWS_ACCOUNT_ID
+    used_by: [iac-pr.yml, iac-apply.yml, iac-drift.yml, preview-env.yml]
+    purpose: Account ID substituted into OIDC role ARNs.
+  - name: INFRACOST_API_KEY
+    used_by: [iac-pr.yml]
+    purpose: Infracost FinOps gate.
+  - name: SONAR_TOKEN
+    used_by: [backend-ci.yml]
+    purpose: SonarQube delta/branch scan.
+  - name: SONAR_HOST_URL
+    used_by: [backend-ci.yml]
+    purpose: SonarQube instance URL.
+  - name: GITOPS_TOKEN
+    used_by: [backend-ci.yml]
+    purpose: Write access to the GitOps manifest repo.
+  - name: OCI_USERNAME
+    used_by: [backend-ci.yml]
+    conditional: "OCI_REGISTRY != ghcr.io"
+    purpose: Username for non-GHCR OCI registries (docker login).
+  - name: OCI_PASSWORD
+    used_by: [backend-ci.yml]
+    conditional: "OCI_REGISTRY != ghcr.io"
+    purpose: Password or token for non-GHCR OCI registries.
+  - name: SLACK_WEBHOOK_URL
+    used_by: [iac-drift.yml]
+    optional: true
+    purpose: Drift incident alerts.
+  - name: DORA_ENDPOINT
+    used_by: [dora-emit.yml]
+    optional: true
+    purpose: HTTP sink for DORA events.
+
+# ------------------------------------------------------------------------------
+# 7. Platform prerequisites the template ASSUMES exist in your cluster
+#    (the pipeline will fail fast if any of these are missing)
+# ------------------------------------------------------------------------------
+platform_prerequisites:
+  cloud:
+    - "AWS account with GitHub OIDC provider trust configured"
+    - "Four IAM roles: gh-actions-tf-plan-<env>, gh-actions-tf-apply-<env>, gh-actions-tf-drift-<env>, gh-actions-preview-provisioner"
+    - "S3 bucket + DynamoDB table for Terraform state (placeholder values in terraform/backends/*.hcl)"
+  kubernetes:
+    - "A cluster you can reach via `aws eks update-kubeconfig` (swap for your provider CLI if not EKS)"
+    - "Argo Rollouts controller installed"
+    - "Kyverno controller installed"
+    - "Istio (or any mesh emitting istio_requests_total + istio_request_duration_milliseconds_bucket)"
+    - "Prometheus reachable at http://prometheus.monitoring.svc.cluster.local:9090"
+    - "ingress-nginx (or override className per service)"
+    - "cert-manager issuing TLS for preview hosts"
+  developer_tools:
+    - "SonarQube or SonarCloud (PR + branch path)"
+    - "Infracost (API key)"
+    - "GHCR (or any OCI registry that accepts the same OIDC identity)"
+  internal_services:
+    - "Optional: AIOps anomaly service at https://aiops.platform.svc.cluster.local:8443 (delete the AnalysisTemplate if you do not run one)"
+    - "Optional: DORA events sink receiving POST /v1/events"
+
+# ------------------------------------------------------------------------------
+# 8. Your adoption checklist
+# ------------------------------------------------------------------------------
+todo:
+  - "Rename the Go module: go mod edit -module <your-module> && go mod tidy"
+  - "Replace every placeholder in terraform/backends/*.hcl"
+  - "Replace every placeholder in terraform/environments/*.tfvars"
+  - "Replace <APP_NAME>, <APP_NAMESPACE>, <APP_OWNER>, <OCI_REGISTRY>, <OWNER>/<REPO>, <DIGEST>, <HTTP_PORT>, <METRICS_PORT>, <HEALTH_PATH>, <READINESS_PATH> in k8s/rollouts/canary-rollout.yaml"
+  - "Replace <OCI_REGISTRY>, <ALT_OCI_REGISTRY>, <OCI_NAMESPACE>, <OWNER>/<REPO> in k8s/policies/require-signed-images.yaml"
+  - "Replace the placeholder block in k8s/controllers/ttl-reaper-deployment.yaml"
+  - "Set OCI_USERNAME + OCI_PASSWORD secrets if your OCI_REGISTRY is not ghcr.io"
+  - "Review k8s/preview/networkpolicy.yaml or point PREVIEW_NETPOL_FILE at your own overlay"
+  - "Set every Variable listed above in the repository's Actions settings"
+  - "Decide whether you run Istio/Kyverno/Argo Rollouts/AIOps; if not, remove the relevant analysis templates and admission rules"
