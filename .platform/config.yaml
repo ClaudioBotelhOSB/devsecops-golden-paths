@@ -2,7 +2,7 @@
 # .platform/config.yaml
 # SINGLE SOURCE OF TRUTH for every customizable knob in this template.
 #
-# This file is informational — the workflows, charts, and Makefile read
+# This file is informational - the workflows, charts, and Makefile read
 # their defaults from GitHub Actions `vars` / environment variables, not
 # from this YAML. The purpose of this file is to give you ONE PLACE to
 # review every value you need to decide on before the pipeline runs

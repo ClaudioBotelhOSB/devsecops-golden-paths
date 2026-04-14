@@ -21,17 +21,17 @@ pattern together.
 
 What is **genuinely reusable across stacks**:
 
-- The Helm chart (`charts/backend-template`) — language-agnostic, driven
+- The Helm chart (`charts/backend-template`) - language-agnostic, driven
   entirely by `.Values` (container command, args, ports, probes, labels).
   Ships with pragmatic defaults (replicaCount 2, tag `latest`, one HTTP
   port, service enabled) that render something valid; each one is
   overridable.
-- The k6 smoke + load suite and the Playwright suite — every endpoint,
+- The k6 smoke + load suite and the Playwright suite - every endpoint,
   method, body, header, and threshold is env-driven.
 - The Kyverno signed-image policy, the Argo Rollouts canary analysis, and
-  the TTL reaper — all shipped as placeholder manifests you substitute
+  the TTL reaper - all shipped as placeholder manifests you substitute
   with `envsubst` or a GitOps overlay.
-- The FinOps contract (`.platform/budgets.yaml`, tag policy-as-code) —
+- The FinOps contract (`.platform/budgets.yaml`, tag policy-as-code) -
   independent of the application language.
 
 What is **still partially Go-HTTP-flavored** (honest):
@@ -48,9 +48,9 @@ What is **still partially Go-HTTP-flavored** (honest):
 
 What is **Go-specific** (will need forking for other stacks):
 
-- [backend-ci.yml](.github/workflows/backend-ci.yml) — uses `go test`, `go vet`, `go mod`, `golangci-lint`, `gosec`, `go-junit-report`.
-- [Dockerfile](Dockerfile) — builds `./cmd/${CMD}` with `CGO_ENABLED=0`.
-- [cmd/api/main.go](cmd/api/main.go) and [cmd/ttl-reaper/main.go](cmd/ttl-reaper/main.go) — Go source scaffolds.
+- [backend-ci.yml](.github/workflows/backend-ci.yml) - uses `go test`, `go vet`, `go mod`, `golangci-lint`, `gosec`, `go-junit-report`.
+- [Dockerfile](Dockerfile) - builds `./cmd/${CMD}` with `CGO_ENABLED=0`.
+- [cmd/api/main.go](cmd/api/main.go) and [cmd/ttl-reaper/main.go](cmd/ttl-reaper/main.go) - Go source scaffolds.
 - [go.mod](go.mod), [go.sum](go.sum), [Makefile](Makefile) Go targets.
 
 If you want Node/Python/JVM, see [Stack split](#stack-split-if-you-are-not-on-go).
@@ -75,7 +75,7 @@ the workflows that depend on a missing piece instead.
 
 ### Kubernetes cluster
 - A cluster you can reach with `aws eks update-kubeconfig` (or the
-  equivalent for your provider — the workflows call that one command,
+  equivalent for your provider - the workflows call that one command,
   swap it for yours in [preview-env.yml](.github/workflows/preview-env.yml) if you're on GKE/AKS/OKE/self-hosted).
 - **Argo Rollouts** controller installed.
 - **Kyverno** controller installed.
@@ -91,10 +91,10 @@ the workflows that depend on a missing piece instead.
 - **GHCR** (or any OCI registry that accepts the same OIDC identity).
 - **SonarQube / SonarCloud** (PR + branch path).
 - **Infracost** (API key).
-- **Slack** (optional — for drift alerts).
-- **AIOps anomaly service** (optional — deleting the `aiops-anomaly`
+- **Slack** (optional - for drift alerts).
+- **AIOps anomaly service** (optional - deleting the `aiops-anomaly`
   AnalysisTemplate in [canary-rollout.yaml](k8s/rollouts/canary-rollout.yaml) is supported and expected).
-- **DORA endpoint** (optional — [dora-emit.yml](.github/workflows/dora-emit.yml) degrades gracefully if
+- **DORA endpoint** (optional - [dora-emit.yml](.github/workflows/dora-emit.yml) degrades gracefully if
   `DORA_ENDPOINT` is unset).
 
 ---
@@ -118,7 +118,7 @@ variables → Actions → Variables**, then read that file for every knob.
 5. **Decide on your OCI registry**. If it is GHCR, nothing else to do.
    If it is anything else (Quay, ECR, GAR, Harbor, self-hosted), set
    `OCI_REGISTRY` as a Variable AND `OCI_USERNAME` + `OCI_PASSWORD` as
-   Secrets — `backend-ci.yml` branches on the registry host and uses
+   Secrets - `backend-ci.yml` branches on the registry host and uses
    those creds for non-GHCR registries.
 
 ### Repository Variables (public, not secrets)
@@ -204,7 +204,7 @@ See [values.yaml](charts/backend-template/values.yaml) for the full schema.
 ### Terraform (`terraform/`)
 
 Minimal AWS S3 + IRSA scaffold so the IaC pipeline is plannable out of
-the box. Every value is a placeholder or a required variable — no
+the box. Every value is a placeholder or a required variable - no
 defaults bleed the template author's region, cost center, or owner into
 your stack.
 
@@ -242,7 +242,7 @@ That split is NOT implemented here. If your service is not Go:
    stage with your own.
 3. Keep every other layer intact: the chart, the Argo Rollouts manifest,
    the Kyverno policy, the Terraform, the k6/Playwright/Patrol tests, the
-   DORA emitter, the preview env workflow, the signed-plan chain — none
+   DORA emitter, the preview env workflow, the signed-plan chain - none
    of those care what language you use.
 4. Update the `build-sign` matrix to reference your new Dockerfile.
 

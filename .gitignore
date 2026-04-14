@@ -1,5 +1,5 @@
 # ============================================================
-# .gitignore — devsecops-golden-paths
+# .gitignore - devsecops-golden-paths
 # ============================================================
 
 # ─── Terraform ───────────────────────────────────────────────
@@ -7,7 +7,7 @@
 terraform/.terraform/
 **/.terraform/providers/
 **/.terraform/plugins/
-# Terraform state files (contain secrets — NEVER commit)
+# Terraform state files (contain secrets - NEVER commit)
 *.tfstate
 *.tfstate.backup
 *.tfstate.*.backup
