@@ -1,0 +1,50 @@
+# ==============================================================================
+# .yamllint.yaml
+# Owner: platform engineering
+# ==============================================================================
+
+extends: default
+
+ignore: |
+  .github/workflows/*.yml
+  k8s/**/generated/
+  node_modules/
+
+rules:
+  braces:
+    max-spaces-inside: 1
+    level: warning
+  brackets:
+    max-spaces-inside: 1
+    level: warning
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  document-start:
+    present: false
+  empty-lines:
+    max: 2
+    max-start: 0
+    max-end: 1
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+    check-multi-line-strings: false
+  line-length:
+    max: 160
+    level: warning
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+  new-line-at-end-of-file: enable
+  new-lines:
+    type: unix
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+  quoted-strings:
+    quote-type: any
+    required: only-when-needed
+  trailing-spaces: enable
+  truthy:
+    allowed-values: ["true", "false", "on", "off"]
+    check-keys: false

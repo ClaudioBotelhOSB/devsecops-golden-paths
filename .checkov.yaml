@@ -1,0 +1,59 @@
+# ==============================================================================
+# .checkov.yaml - Policy-as-code guardrails for Terraform/IaC
+# Owner: platform engineering
+# Consumed by:
+#   - .pre-commit-config.yaml  (local hook)
+#   - .github/workflows/iac-pr.yml  (server gate)
+# ==============================================================================
+
+framework:
+  - terraform
+  - terraform_plan
+  - kubernetes
+  - dockerfile
+  - github_actions
+
+directory:
+  - terraform
+  - k8s
+  - .github/workflows
+
+soft-fail: false
+quiet: true
+compact: true
+download-external-modules: true
+
+# Fail the pipeline on any HIGH or CRITICAL finding.
+hard-fail-on:
+  - HIGH
+  - CRITICAL
+
+# Warn on MEDIUM findings but do not block.
+soft-fail-on:
+  - LOW
+  - MEDIUM
+
+# Documented exceptions. Every skip must be justified below.
+skip-check:
+  # CKV_AWS_50: X-Ray tracing not required for short-lived batch jobs
+  - CKV_AWS_50
+  # CKV_AWS_144: Cross-region replication handled at org policy level
+  - CKV_AWS_144
+  # CKV2_AWS_38: Route53 DNSSEC managed out-of-band in separate repo
+  - CKV2_AWS_38
+  # CKV_K8S_43: Digest pinning is enforced by Kyverno policy, not Checkov
+  - CKV_K8S_43
+
+# Block on these specific rules even when they are LOW/MEDIUM severity.
+check:
+  - CKV_AWS_18   # S3 access logging
+  - CKV_AWS_21   # S3 versioning
+  - CKV_AWS_145  # KMS for S3
+  - CKV_AWS_24   # No SG ingress from 0.0.0.0/0 on 22
+  - CKV_AWS_79   # IMDSv2 required
+  - CKV_K8S_8    # Liveness probe
+  - CKV_K8S_9    # Readiness probe
+  - CKV_K8S_20   # runAsNonRoot
+  - CKV_K8S_22   # readOnlyRootFilesystem
+  - CKV_K8S_28   # Drop ALL capabilities
+  - CKV_K8S_37   # Seccomp profile

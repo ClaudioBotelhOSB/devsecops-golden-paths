@@ -1,0 +1,203 @@
+# ==============================================================================
+# .pre-commit-config.yaml
+# Zero-Trust Delivery Platform - Phase A (Millisecond-Zero Defense)
+# Maintainer: platform-team
+#
+# Install:   pip install pre-commit && pre-commit install --install-hooks
+# Run all:   pre-commit run --all-files
+# Update:    pre-commit autoupdate
+#
+# NOTE: These hooks are advisory on the developer laptop. The exact same
+#       gitleaks/tflint/checkov invocations run server-side as blocking
+#       gates in .github/workflows/*. A developer using `git commit --no-verify`
+#       does not escape the server-side enforcement.
+# ==============================================================================
+
+fail_fast: false
+default_stages: [pre-commit, pre-push]
+default_install_hook_types: [pre-commit, pre-push, commit-msg]
+
+minimum_pre_commit_version: "3.5.0"
+
+repos:
+  # ----------------------------------------------------------------------------
+  # Secret scanning - LOAD BEARING. Never disable.
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+        name: gitleaks (secret scan)
+        description: Block AWS keys, Stripe secrets, JWTs, private keys
+        stages: [pre-commit, pre-push]
+
+  # ----------------------------------------------------------------------------
+  # Baseline hygiene
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: check-json
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: no-commit-to-branch
+        args: [--branch, main, --branch, master, --branch, production]
+
+  # ----------------------------------------------------------------------------
+  # Conventional commits (enforced in commit-msg)
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [--strict, --force-scope, feat, fix, chore, docs, refactor, test, perf, build, ci, revert]
+
+  # ----------------------------------------------------------------------------
+  # Shell / Dockerfile / YAML
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: [--severity=warning, --shell=bash]
+
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.13.1-beta
+    hooks:
+      - id: hadolint-docker
+        args: [--ignore, DL3008, --ignore, DL3013, --failure-threshold, warning]
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: [-c=.yamllint.yaml, --strict]
+
+  # ----------------------------------------------------------------------------
+  # Terraform / IaC
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.2
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_tflint
+        args:
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
+      - id: terraform_checkov
+        args:
+          - --args=--quiet
+          - --args=--framework=terraform
+          - --args=--config-file=.checkov.yaml
+      - id: terraform_docs
+
+  - repo: https://github.com/aquasecurity/tfsec
+    rev: v1.28.11
+    hooks:
+      - id: tfsec
+        args: [--soft-fail, --concise-output, --minimum-severity=MEDIUM]
+
+  # ----------------------------------------------------------------------------
+  # Go (backend services under cmd/)
+  # ----------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: go-fmt
+        name: gofmt
+        description: gofmt - enforce canonical Go formatting
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+        pass_filenames: true
+
+      - id: go-vet
+        name: go vet
+        description: Report suspicious constructs
+        entry: bash -c 'go vet ./...'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: go-mod-tidy
+        name: go mod tidy
+        description: Sync go.mod and go.sum
+        entry: bash -c 'go mod tidy -v'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: golangci-lint
+        name: golangci-lint
+        description: Fast Go linters aggregator
+        entry: bash -c 'golangci-lint run --fix --timeout=5m ./...'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: go-test-short
+        name: go test (short)
+        description: Run short unit tests before commit
+        entry: bash -c 'go test -short -race -timeout=2m ./...'
+        language: system
+        types: [go]
+        pass_filenames: false
+        stages: [pre-push]
+
+  # ----------------------------------------------------------------------------
+  # Dart / Flutter (optional mobile app, e.g. tests/patrol)
+  # ----------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: dart-format
+        name: dart format
+        entry: dart format --set-exit-if-changed
+        language: system
+        files: \.dart$
+
+      - id: flutter-analyze
+        name: flutter analyze
+        entry: bash -c 'flutter analyze --no-pub --no-fatal-infos'
+        language: system
+        files: \.dart$
+        pass_filenames: false
+
+  # ----------------------------------------------------------------------------
+  # Kubernetes manifests
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/instrumenta/kubeval
+    rev: v0.16.1
+    hooks:
+      - id: kubeval
+        files: ^k8s/.*\.ya?ml$
+
+  - repo: https://github.com/stackrox/kube-linter
+    rev: v0.7.2
+    hooks:
+      - id: kube-linter
+        files: ^k8s/.*\.ya?ml$
+
+  # ----------------------------------------------------------------------------
+  # Commit / PR commit-msg enforcement
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/jorisroovers/gitlint
+    rev: v0.19.1
+    hooks:
+      - id: gitlint
+        stages: [commit-msg]
+        args: [--msg-filename]
