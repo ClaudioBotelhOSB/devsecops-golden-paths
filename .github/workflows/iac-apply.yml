@@ -65,6 +65,7 @@ jobs:
       envs:     ${{ steps.set.outputs.envs }}
       run_id:   ${{ steps.set.outputs.run_id }}
       head_sha: ${{ steps.set.outputs.head_sha }}
+      has_aws:  ${{ steps.set.outputs.has_aws }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -74,8 +75,15 @@ jobs:
       - id: set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # secrets are unavailable in job-level `if`; expose presence as an
+          # output so the apply job can skip cleanly in template mode.
+          HAS_AWS: ${{ secrets.AWS_ACCOUNT_ID != '' }}
         run: |
           set -euo pipefail
+          echo "has_aws=${HAS_AWS}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_AWS}" != "true" ]; then
+            echo "::notice title=Apply skipped::AWS_ACCOUNT_ID secret is not configured; signed-plan apply will be skipped."
+          fi
 
           # The signed plan artifact was uploaded by iac-pr.yml as
           #   tfplan-<env>-<pull_request.head.sha>
@@ -147,7 +155,7 @@ jobs:
   # ----------------------------------------------------------------------------
   apply:
     name: Apply signed plan (${{ matrix.env }})
-    if: needs.resolve.outputs.envs != '[]'
+    if: needs.resolve.outputs.envs != '[]' && needs.resolve.outputs.has_aws == 'true'
     runs-on: ubuntu-24.04
     needs: [resolve]
     environment: ${{ matrix.env }}          # forces environment protection rules

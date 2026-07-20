@@ -70,12 +70,20 @@ jobs:
       pr: ${{ steps.set.outputs.pr }}
       head_sha: ${{ steps.set.outputs.head_sha }}
       run_id: ${{ steps.set.outputs.run_id }}
+      has_aws: ${{ steps.set.outputs.has_aws }}
     steps:
       - id: set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # secrets are unavailable in job-level `if`; expose presence as an
+          # output so provision can skip cleanly when no cluster is wired up.
+          HAS_AWS: ${{ secrets.AWS_ACCOUNT_ID != '' }}
         run: |
           set -euo pipefail
+          echo "has_aws=${HAS_AWS}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_AWS}" != "true" ]; then
+            echo "::notice title=Preview provision skipped::AWS_ACCOUNT_ID secret is not configured; preview environments are disabled."
+          fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             PR="${{ inputs.pr_number }}"
             HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR}" --jq '.head.sha')
@@ -104,6 +112,7 @@ jobs:
   provision:
     name: Provision preview env
     needs: should-provision
+    if: needs.should-provision.outputs.has_aws == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -296,9 +305,28 @@ jobs:
   # ----------------------------------------------------------------------------
   # TEARDOWN on PR close (merged or abandoned)
   # ----------------------------------------------------------------------------
+  teardown-gate:
+    name: Gate preview teardown
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      has_aws: ${{ steps.check.outputs.has_aws }}
+    steps:
+      - id: check
+        env:
+          HAS_AWS: ${{ secrets.AWS_ACCOUNT_ID != '' }}
+        run: |
+          echo "has_aws=${HAS_AWS}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_AWS}" != "true" ]; then
+            echo "::notice title=Teardown skipped::AWS_ACCOUNT_ID secret is not configured; no preview cluster to tear down."
+          fi
+
   teardown:
     name: Teardown preview env
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    needs: teardown-gate
+    if: needs.teardown-gate.outputs.has_aws == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

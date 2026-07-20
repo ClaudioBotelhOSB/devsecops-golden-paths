@@ -199,10 +199,11 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node (pinned)
+        # no `cache: npm` - the suite has no committed lockfile, and
+        # setup-node hard-fails when it cannot find one.
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
         with:
           node-version: "20.18.0"
-          cache: npm
 
       - name: Download quarantine list
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
@@ -213,7 +214,7 @@ jobs:
       - name: Install dependencies
         working-directory: tests/e2e
         run: |
-          npm ci
+          npm install
           npx playwright install --with-deps chromium
 
       - name: Run Playwright (strict TLS)
@@ -304,6 +305,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      issues: write          # create labels idempotently
       actions: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -368,17 +370,34 @@ jobs:
             echo "no quarantine changes"
             exit 0
           fi
-          BR="quarantine/nightly-$(date -u +%Y%m%d)"
+          # Fixed branch name: force-pushed nightly so failed runs never
+          # accumulate one orphan branch per day.
+          BR="quarantine/nightly"
           git config user.name  "${{ env.PLATFORM_BOT_NAME }}"
           git config user.email "${{ env.PLATFORM_BOT_EMAIL }}"
-          git checkout -b "${BR}"
+          git checkout -B "${BR}"
           git add tests/quarantine/quarantine.json
           git commit -m "chore(quarantine): nightly refresh"
-          git push -u origin "${BR}"
-          gh pr create \
+          git push -f -u origin "${BR}"
+
+          # Labels must exist before `gh pr create --label` or it exits 1
+          # after the branch was already pushed.
+          gh label create quarantine --color FBCA04 --description "Auto-quarantined flaky tests" --force
+          gh label create automated  --color BFD4F2 --description "Created by automation" --force
+
+          if [ -n "$(gh pr list --head "${BR}" --state open --json number --jq '.[].number')" ]; then
+            echo "quarantine PR already open - branch updated in place"
+            exit 0
+          fi
+
+          if ! gh pr create \
+            --base "${GITHUB_REF_NAME}" \
+            --head "${BR}" \
             --title "chore(quarantine): nightly refresh" \
             --body  "Updated quarantine list from last 14 runs." \
-            --label "quarantine,automated"
+            --label "quarantine,automated"; then
+            echo "::warning title=Quarantine PR not created::Branch ${BR} was pushed but the PR could not be opened. Enable 'Allow GitHub Actions to create and approve pull requests' under Settings > Actions > General, then open the PR manually from ${BR}."
+          fi
 
   # ----------------------------------------------------------------------------
   # Required status gate
@@ -386,7 +405,9 @@ jobs:
   e2e-gate:
     name: E2E gate
     runs-on: ubuntu-24.04
-    needs: [k6, playwright, patrol]
+    # `resolve` must be in needs or `needs.resolve.outputs.*` is empty and
+    # this gate silently never runs.
+    needs: [resolve, k6, playwright, patrol]
     if: always() && needs.resolve.outputs.quarantine == '1'
     permissions:
       contents: read

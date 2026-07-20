@@ -212,6 +212,11 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    env:
+      # surfaced at job level so step-level `if: env.SONAR_TOKEN != ''`
+      # can skip the Sonar steps gracefully when the secrets are absent.
+      SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -257,11 +262,8 @@ jobs:
           category: gosec
 
       - name: SonarQube - PR path
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != ''
         uses: SonarSource/sonarqube-scan-action@aa494459d7c39c106cc77b166de8b4250a32bb97
-        env:
-          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           args: >
             -Dsonar.projectKey=${{ github.event.repository.name }}
@@ -276,11 +278,8 @@ jobs:
             -Dsonar.qualitygate.wait=true
 
       - name: SonarQube - branch path
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != ''
         uses: SonarSource/sonarqube-scan-action@aa494459d7c39c106cc77b166de8b4250a32bb97
-        env:
-          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           args: >
             -Dsonar.projectKey=${{ github.event.repository.name }}
@@ -640,15 +639,13 @@ jobs:
           IMAGE:    ${{ steps.digest.outputs.image }}
         run: |
           set -euo pipefail
-          DEP_ID=$(gh api \
-            -X POST \
-            "repos/${{ github.repository }}/deployments" \
-            -f ref="${{ github.sha }}" \
-            -f environment="staging" \
-            -f description="${{ github.event.repository.name }} build ${{ github.run_id }}" \
-            -F auto_merge=false \
-            -f required_contexts[] \
-            --jq '.id')
+          # `-f required_contexts[]` is not valid gh syntax (every -f needs
+          # key=value); an empty array must go through a JSON body instead.
+          DEP_ID=$(jq -n \
+            --arg ref  "${{ github.sha }}" \
+            --arg desc "${{ github.event.repository.name }} build ${{ github.run_id }}" \
+            '{ref: $ref, environment: "staging", description: $desc, auto_merge: false, required_contexts: []}' \
+            | gh api -X POST "repos/${{ github.repository }}/deployments" --input - --jq '.id')
 
           gh api \
             -X POST \
@@ -665,7 +662,10 @@ jobs:
   gitops-bump:
     name: GitOps manifest bump
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Only runs when a manifest repo is actually configured (repo Variable
+    # GITOPS_REPO + secret GITOPS_TOKEN); otherwise every push to main fails
+    # at the checkout of a repo that does not exist.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.GITOPS_REPO != ''
     needs: [build-sign]
     permissions:
       contents: read

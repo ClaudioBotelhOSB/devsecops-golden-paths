@@ -59,7 +59,9 @@ jobs:
     permissions:
       contents: read
     outputs:
-      environments: ${{ steps.set.outputs.environments }}
+      environments:  ${{ steps.set.outputs.environments }}
+      has_aws:       ${{ steps.creds.outputs.has_aws }}
+      has_infracost: ${{ steps.creds.outputs.has_infracost }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -86,6 +88,24 @@ jobs:
           fi
           JSON=$(printf '%s\n' "${CHANGED[@]}" | jq -R . | jq -sc .)
           echo "environments=${JSON}" >> "$GITHUB_OUTPUT"
+
+      - id: creds
+        name: Detect optional cloud credentials
+        env:
+          # secrets are unavailable in job-level `if`, so expose presence
+          # flags as outputs for downstream jobs/steps to gate on.
+          HAS_AWS:       ${{ secrets.AWS_ACCOUNT_ID != '' }}
+          HAS_INFRACOST: ${{ secrets.INFRACOST_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          echo "has_aws=${HAS_AWS}"             >> "$GITHUB_OUTPUT"
+          echo "has_infracost=${HAS_INFRACOST}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_AWS}" != "true" ]; then
+            echo "::notice title=Plan/Sign/FinOps skipped::AWS_ACCOUNT_ID secret is not configured; only static analysis will run on this PR."
+          fi
+          if [ "${HAS_INFRACOST}" != "true" ]; then
+            echo "::notice title=FinOps cost gate skipped::INFRACOST_API_KEY secret is not configured; Infracost steps will be skipped."
+          fi
 
   # ----------------------------------------------------------------------------
   # Static analysis
@@ -124,7 +144,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: tflint run
-        run: tflint --chdir=terraform --recursive --format=compact --config=$(pwd)/.tflint.hcl
+        # --chdir and --recursive are mutually exclusive in tflint; run from
+        # the terraform dir instead.
+        working-directory: terraform
+        run: tflint --recursive --format=compact --config="${GITHUB_WORKSPACE}/.tflint.hcl"
 
       - name: tfsec
         # aquasecurity/tfsec-sarif-action@v0.1.4
@@ -141,8 +164,10 @@ jobs:
           category: tfsec
 
       - name: checkov
-        # bridgecrewio/checkov-action@v12.2.321
-        uses: bridgecrewio/checkov-action@ea75bba60b3ed4696b5d0cd8f3a1a88da7d3d2c5
+        # bridgecrewio/checkov-action@v12.3114.0
+        # (previous pin pointed at a commit SHA that does not exist upstream,
+        # which fails the job at action-resolution time)
+        uses: bridgecrewio/checkov-action@7b972723c44fb3d256283fac96fae5d7c1894bb7
         with:
           directory: terraform
           framework: terraform
@@ -171,6 +196,7 @@ jobs:
     name: Plan / Sign / FinOps (${{ matrix.env }})
     runs-on: ubuntu-24.04
     needs: [discover, static-analysis]
+    if: needs.discover.outputs.has_aws == 'true'
     permissions:
       contents: read
       id-token: write          # OIDC -> AWS + Cosign keyless
@@ -322,11 +348,14 @@ jobs:
       # ------------------------------------------------------------------
       - name: Setup Infracost
         # infracost/actions/setup@v3.0.1
-        uses: infracost/actions/setup@9e19f4034fef9d42fc03fb420373d8afbf9f96ae
+        # (previous pin pointed at a commit SHA that does not exist upstream)
+        if: env.INFRACOST_API_KEY != ''
+        uses: infracost/actions/setup@e9d6e6cd65e168e76b0de50ff9957d2fe8bb1832
         with:
           api-key: ${{ env.INFRACOST_API_KEY }}
 
       - name: Infracost - main baseline
+        if: env.INFRACOST_API_KEY != ''
         run: |
           set -euo pipefail
           git fetch origin main:main || true
@@ -338,6 +367,7 @@ jobs:
             --out-file=/tmp/main-baseline.${{ matrix.env }}.json || true
 
       - name: Infracost - HEAD baseline
+        if: env.INFRACOST_API_KEY != ''
         run: |
           infracost breakdown \
             --path=terraform \
@@ -347,6 +377,7 @@ jobs:
 
       - name: Infracost - diff
         id: diff
+        if: env.INFRACOST_API_KEY != ''
         run: |
           infracost diff \
             --path=/tmp/head-baseline.${{ matrix.env }}.json \
@@ -360,6 +391,7 @@ jobs:
 
       - name: Enforce FinOps policy (hard + soft + approval + tags)
         id: policy
+        if: env.INFRACOST_API_KEY != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -416,7 +448,7 @@ jobs:
           fi
 
       - name: Infracost PR comment
-        if: always()
+        if: always() && env.INFRACOST_API_KEY != ''
         run: |
           infracost comment github \
             --path=/tmp/diff.${{ matrix.env }}.json \
@@ -456,9 +488,18 @@ jobs:
       - name: Evaluate
         run: |
           set -euo pipefail
-          if [ "${{ needs.static-analysis.result }}"   != "success" ] || \
-             [ "${{ needs.plan-sign-finops.result }}"  != "success" ]; then
-            echo "::error::IaC gate failed - see upstream job logs"
+          if [ "${{ needs.static-analysis.result }}" != "success" ]; then
+            echo "::error::IaC gate failed - static analysis result: ${{ needs.static-analysis.result }}"
             exit 1
           fi
-          echo "IaC gate green - signed plan artifacts ready for apply stage"
+          # plan-sign-finops is legitimately skipped when AWS credentials
+          # are not configured (template mode); anything else must succeed.
+          case "${{ needs.plan-sign-finops.result }}" in
+            success)
+              echo "IaC gate green - signed plan artifacts ready for apply stage" ;;
+            skipped)
+              echo "IaC gate green (static analysis only - AWS credentials not configured)" ;;
+            *)
+              echo "::error::IaC gate failed - plan-sign-finops result: ${{ needs.plan-sign-finops.result }}"
+              exit 1 ;;
+          esac
